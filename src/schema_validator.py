@@ -206,14 +206,15 @@ class ModelSchema(SharedSchema):
     MODEL_ENTRY_META_KEY = "model_metadata"
 
     TARGET_TYPE_KEY = "target_type"
-    TARGET_TYPE_BINARY_KEY = "Binary"
-    TARGET_TYPE_REGRESSION_KEY = "Regression"
-    TARGET_TYPE_MULTICLASS_KEY = "Multiclass"
-    TARGET_TYPE_ANOMALY_DETECTION_KEY = "Anomaly Detection"
-    TARGET_TYPE_UNSTRUCTURED_BINARY_KEY = "Unstructured (Binary)"
-    TARGET_TYPE_UNSTRUCTURED_REGRESSION_KEY = "Unstructured (Regression)"
-    TARGET_TYPE_UNSTRUCTURED_MULTICLASS_KEY = "Unstructured (Multiclass)"
-    TARGET_TYPE_UNSTRUCTURED_OTHER_KEY = "Unstructured (Other)"
+    TARGET_TYPE_BINARY = "Binary"
+    TARGET_TYPE_REGRESSION = "Regression"
+    TARGET_TYPE_MULTICLASS = "Multiclass"
+    TARGET_TYPE_ANOMALY_DETECTION = "Anomaly Detection"
+    TARGET_TYPE_TEXT_GENERATION = "TextGeneration"
+    TARGET_TYPE_UNSTRUCTURED_BINARY = "Unstructured (Binary)"
+    TARGET_TYPE_UNSTRUCTURED_REGRESSION = "Unstructured (Regression)"
+    TARGET_TYPE_UNSTRUCTURED_MULTICLASS = "Unstructured (Multiclass)"
+    TARGET_TYPE_UNSTRUCTURED_OTHER = "Unstructured (Other)"
 
     TARGET_NAME_KEY = "target_name"
 
@@ -243,6 +244,18 @@ class ModelSchema(SharedSchema):
     EXCLUDE_GLOB_KEY = "exclude_glob_pattern"
     MEMORY_KEY = "memory"
     REPLICAS_KEY = "replicas"
+    EGRESS_NETWORK_POLICY_KEY = "egress_network_policy"
+    EGRESS_NETWORK_POLICY_NONE = "NONE"
+    EGRESS_NETWORK_POLICY_PUBLIC = "PUBLIC"
+
+    MODEL_REPLACEMENT_REASON_KEY = "model_replacement_reason"
+    MODEL_REPLACEMENT_REASON_ACCURACY = "ACCURACY"
+    MODEL_REPLACEMENT_REASON_DATA_DRIFT = "DATA_DRIFT"
+    MODEL_REPLACEMENT_REASON_ERRORS = "ERRORS"
+    MODEL_REPLACEMENT_REASON_SCHEDULED_REFRESH = "SCHEDULED_REFRESH"
+    MODEL_REPLACEMENT_REASON_SCORING_SPEED = "SCORING_SPEED"
+    MODEL_REPLACEMENT_REASON_DEPRECATION = "DEPRECATION"
+    MODEL_REPLACEMENT_REASON_OTHER = "OTHER"
 
     TEST_KEY = "test"
     TEST_SKIP_KEY = "skip"
@@ -269,18 +282,24 @@ class ModelSchema(SharedSchema):
     MINIMUM_PAYLOAD_SIZE_KEY = "minimum_payload_size"
     MAXIMUM_PAYLOAD_SIZE_KEY = "maximum_payload_size"
 
+    MODEL_REGISTRY_KEY = "model_registry"
+    MODEL_NAME = "model_name"
+    MODEL_DESCRIPTION = "model_description"
+    GLOBAL = "global"
+
     MODEL_SCHEMA = Schema(
         {
             SharedSchema.MODEL_ID_KEY: And(str, len, Use(Namespace.namespaced)),
             TARGET_TYPE_KEY: Or(
-                TARGET_TYPE_BINARY_KEY,
-                TARGET_TYPE_REGRESSION_KEY,
-                TARGET_TYPE_MULTICLASS_KEY,
-                TARGET_TYPE_ANOMALY_DETECTION_KEY,
-                TARGET_TYPE_UNSTRUCTURED_BINARY_KEY,
-                TARGET_TYPE_UNSTRUCTURED_REGRESSION_KEY,
-                TARGET_TYPE_UNSTRUCTURED_MULTICLASS_KEY,
-                TARGET_TYPE_UNSTRUCTURED_OTHER_KEY,
+                TARGET_TYPE_BINARY,
+                TARGET_TYPE_REGRESSION,
+                TARGET_TYPE_MULTICLASS,
+                TARGET_TYPE_ANOMALY_DETECTION,
+                TARGET_TYPE_TEXT_GENERATION,
+                TARGET_TYPE_UNSTRUCTURED_BINARY,
+                TARGET_TYPE_UNSTRUCTURED_REGRESSION,
+                TARGET_TYPE_UNSTRUCTURED_MULTICLASS,
+                TARGET_TYPE_UNSTRUCTURED_OTHER,
             ),
             SharedSchema.SETTINGS_SECTION_KEY: {
                 NAME_KEY: And(str, len),
@@ -305,6 +324,21 @@ class ModelSchema(SharedSchema):
                 ),
                 Optional(MEMORY_KEY): Use(MemoryConvertor.to_bytes),
                 Optional(REPLICAS_KEY): And(int, lambda r: r > 0),
+                Optional(EGRESS_NETWORK_POLICY_KEY): Or(
+                    EGRESS_NETWORK_POLICY_NONE, EGRESS_NETWORK_POLICY_PUBLIC
+                ),
+                Optional(PARTITIONING_COLUMN_KEY): And(str, len),
+                Optional(TRAINING_DATASET_ID_KEY): And(str, ObjectId.is_valid),
+                Optional(HOLDOUT_DATASET_ID_KEY): And(str, ObjectId.is_valid),
+                Optional(MODEL_REPLACEMENT_REASON_KEY, default=MODEL_REPLACEMENT_REASON_OTHER): Or(
+                    MODEL_REPLACEMENT_REASON_ACCURACY,
+                    MODEL_REPLACEMENT_REASON_DATA_DRIFT,
+                    MODEL_REPLACEMENT_REASON_ERRORS,
+                    MODEL_REPLACEMENT_REASON_SCHEDULED_REFRESH,
+                    MODEL_REPLACEMENT_REASON_SCORING_SPEED,
+                    MODEL_REPLACEMENT_REASON_DEPRECATION,
+                    MODEL_REPLACEMENT_REASON_OTHER,
+                ),
             },
             Optional(TEST_KEY): {
                 # The skip attribute allows users to have the test section in their yaml file
@@ -346,6 +380,11 @@ class ModelSchema(SharedSchema):
                         Optional(MAXIMUM_PAYLOAD_SIZE_KEY): And(int, lambda v: v >= 1),
                     },
                 },
+            },
+            Optional(MODEL_REGISTRY_KEY): {
+                Optional(MODEL_NAME): And(str, len),
+                Optional(MODEL_DESCRIPTION): And(str, len),
+                Optional(GLOBAL, default=False): bool,
             },
         }
     )
@@ -414,8 +453,8 @@ class ModelSchema(SharedSchema):
         """
 
         return metadata[ModelSchema.TARGET_TYPE_KEY] in [
-            cls.TARGET_TYPE_BINARY_KEY,
-            cls.TARGET_TYPE_UNSTRUCTURED_BINARY_KEY,
+            cls.TARGET_TYPE_BINARY,
+            cls.TARGET_TYPE_UNSTRUCTURED_BINARY,
         ]
 
     @classmethod
@@ -435,8 +474,8 @@ class ModelSchema(SharedSchema):
         """
 
         return metadata[ModelSchema.TARGET_TYPE_KEY] in [
-            cls.TARGET_TYPE_REGRESSION_KEY,
-            cls.TARGET_TYPE_UNSTRUCTURED_REGRESSION_KEY,
+            cls.TARGET_TYPE_REGRESSION,
+            cls.TARGET_TYPE_UNSTRUCTURED_REGRESSION,
         ]
 
     @classmethod
@@ -456,8 +495,8 @@ class ModelSchema(SharedSchema):
         """
 
         return metadata[ModelSchema.TARGET_TYPE_KEY] in [
-            cls.TARGET_TYPE_MULTICLASS_KEY,
-            cls.TARGET_TYPE_UNSTRUCTURED_MULTICLASS_KEY,
+            cls.TARGET_TYPE_MULTICLASS,
+            cls.TARGET_TYPE_UNSTRUCTURED_MULTICLASS,
         ]
 
     @classmethod
@@ -477,10 +516,10 @@ class ModelSchema(SharedSchema):
         """
 
         return metadata[ModelSchema.TARGET_TYPE_KEY] in [
-            ModelSchema.TARGET_TYPE_UNSTRUCTURED_REGRESSION_KEY,
-            ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY_KEY,
-            ModelSchema.TARGET_TYPE_UNSTRUCTURED_MULTICLASS_KEY,
-            ModelSchema.TARGET_TYPE_UNSTRUCTURED_OTHER_KEY,
+            ModelSchema.TARGET_TYPE_UNSTRUCTURED_REGRESSION,
+            ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY,
+            ModelSchema.TARGET_TYPE_UNSTRUCTURED_MULTICLASS,
+            ModelSchema.TARGET_TYPE_UNSTRUCTURED_OTHER,
         ]
 
     @classmethod
@@ -544,9 +583,34 @@ class ModelSchema(SharedSchema):
             if len(mutual_exclusive_keys & settings_section.keys()) > 1:
                 raise InvalidModelSchema(f"Only one of '{mutual_exclusive_keys}' keys is allowed.")
 
+        # Check training/holdout mutually exclusive at model level
         mutual_exclusive_keys = {cls.PARTITIONING_COLUMN_KEY, cls.HOLDOUT_DATASET_ID_KEY}
         if len(mutual_exclusive_keys & settings_section.keys()) > 1:
-            raise InvalidModelSchema(f"Only one of '{mutual_exclusive_keys}' keys is allowed.")
+            raise InvalidModelSchema(
+                f"Only one of '{mutual_exclusive_keys}' keys is allowed in settings section."
+            )
+
+        # Check training/holdout mutually exclusive at model version level
+        version_section = single_transformed_metadata[ModelSchema.VERSION_KEY]
+        if len(mutual_exclusive_keys & version_section.keys()) > 1:
+            raise InvalidModelSchema(
+                f"Only one of '{mutual_exclusive_keys}' keys is allowed in version section."
+            )
+
+        # Check training/holdout mutually exclusive between model and version levels
+        mutual_exclusive_keys = {
+            cls.PARTITIONING_COLUMN_KEY,
+            cls.TRAINING_DATASET_ID_KEY,
+            cls.HOLDOUT_DATASET_ID_KEY,
+        }
+        if (
+            len(mutual_exclusive_keys & settings_section.keys()) > 0
+            and len(mutual_exclusive_keys & version_section.keys()) > 0
+        ):
+            raise InvalidModelSchema(
+                f"Definition of '{mutual_exclusive_keys}' keys are either allowed under settings "
+                "or version sections."
+            )
 
     @classmethod
     def _validate_dependent_keys(cls, single_transformed_metadata):
@@ -616,10 +680,10 @@ class DeploymentSchema(SharedSchema):
     LABEL_KEY = "label"  # Settings, Optional
     DESCRIPTION_KEY = "description"  # Settings, Optional
     IMPORTANCE_KEY = "importance"  # Settings, Optional
-    IMPORTANCE_CRITICAL_VALUE = "CRITICAL"
-    IMPORTANCE_HIGH_VALUE = "HIGH"
-    IMPORTANCE_MODERATE_VALUE = "MODERATE"
-    IMPORTANCE_LOW_VALUE = "LOW"
+    IMPORTANCE_CRITICAL = "CRITICAL"
+    IMPORTANCE_HIGH = "HIGH"
+    IMPORTANCE_MODERATE = "MODERATE"
+    IMPORTANCE_LOW = "LOW"
 
     ENABLE_TARGET_DRIFT_KEY = "enable_target_drift"  # Settings, Optional
     ENABLE_FEATURE_DRIFT_KEY = "enable_feature_drift"  # Settings, Optional
@@ -653,11 +717,8 @@ class DeploymentSchema(SharedSchema):
                 # operation, such as 'create', 'update', 'delete', etc. So, practically
                 # the user will need to wait for approval from a reviewer in order to be able
                 # to apply new changes and merge them to the main branch.
-                Optional(IMPORTANCE_KEY): Or(  # fromModelPackage
-                    IMPORTANCE_CRITICAL_VALUE,
-                    IMPORTANCE_HIGH_VALUE,
-                    IMPORTANCE_MODERATE_VALUE,
-                    IMPORTANCE_LOW_VALUE,
+                Optional(IMPORTANCE_KEY, default=IMPORTANCE_LOW): Or(  # fromModelPackage
+                    IMPORTANCE_CRITICAL, IMPORTANCE_HIGH, IMPORTANCE_MODERATE, IMPORTANCE_LOW
                 ),
                 Optional(ASSOCIATION_KEY): {
                     Optional(ASSOCIATION_ASSOCIATION_ID_COLUMN_KEY): And(str, len),

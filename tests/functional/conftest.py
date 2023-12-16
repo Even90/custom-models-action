@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 from collections import namedtuple
 from functools import lru_cache
 from pathlib import Path
@@ -26,6 +27,7 @@ from git import Repo
 from common.convertors import MemoryConvertor
 from common.exceptions import DataRobotClientError
 from common.exceptions import IllegalModelDeletion
+from common.github_env import GitHubEnv
 from common.namepsace import Namespace
 from dr_client import DrClient
 from main import main
@@ -34,12 +36,29 @@ from schema_validator import ModelSchema
 from schema_validator import SharedSchema
 from tests.conftest import unique_str
 
-FUNCTIONAL_TESTS_NAMESPACE = "/datarobot/gh-action/functional-tests-63e89e5656215589ef3cd3b5"
+FUNCTIONAL_TESTS_NAMESPACE = "{}/datarobot/gh-action/functional-tests"
+NUMBER_OF_MODELS_IN_TEST = 2
+
+
+@pytest.fixture(name="github_repository_id", scope="session")
+def github_repository_id_fixture():
+    """
+    A fixture to return the GitHub repository ID if exists. Otherwise, use the local machine
+    name as the repository ID and return it.
+    """
+
+    unique_repository_id = GitHubEnv.repository_id()
+    if not unique_repository_id:
+        unique_repository_id = socket.gethostname()
+        with github_env_set("GITHUB_REPOSITORY_ID", unique_repository_id):
+            yield unique_repository_id
+    else:
+        yield unique_repository_id
 
 
 # pylint: disable=unused-argument
 @pytest.fixture(name="setup_functional_tests_namespace", scope="session")
-def setup_functional_tests_namespace_fixture():
+def setup_functional_tests_namespace_fixture(github_repository_id):
     """
     A fixture to set up the GitHub action functional tests' namespace. Please note that this is
     required because there could be direct access to modules from the functional tests, such
@@ -47,8 +66,7 @@ def setup_functional_tests_namespace_fixture():
     """
 
     try:
-        with github_env_set("GITHUB_REPOSITORY_ID", "1234567"):
-            Namespace.init(FUNCTIONAL_TESTS_NAMESPACE)
+        Namespace.init(FUNCTIONAL_TESTS_NAMESPACE.format(github_repository_id))
         yield
     finally:
         Namespace.uninit()
@@ -202,9 +220,10 @@ def fixture_git_repo(workspace_path):
     return repo
 
 
+# pylint: disable=too-many-statements
 @pytest.fixture(name="build_repo_for_testing_factory")
 def fixture_build_repo_for_testing_factory(
-    workspace_path, git_repo, sklearn_environment_drop_in_id
+    workspace_path, git_repo, sklearn_environment_drop_in_id, github_repository_id
 ):
     """
     A fixture to build a complete source stree with model and deployment definitions in it. Then
@@ -222,12 +241,14 @@ def fixture_build_repo_for_testing_factory(
             model_metadata = yaml.safe_load(reader)
 
         # Set model ID
+        namespace = FUNCTIONAL_TESTS_NAMESPACE.format(github_repository_id)
+        origin_model_id = model_metadata[ModelSchema.MODEL_ID_KEY]
         unique_string = unique_str()
-        new_model_id = f"{model_metadata[ModelSchema.MODEL_ID_KEY]}-{unique_string}"
+        new_model_id = f"{namespace}/{origin_model_id}-{model_index}-{unique_string}"
         ModelSchema.set_value(model_metadata, ModelSchema.MODEL_ID_KEY, value=new_model_id)
 
         # Set model name
-        new_model_name = f"My Awsome GitHub Model {unique_string} [GitHub CI/CD, Functional Tests]"
+        new_model_name = f"My Awsome GitHub Model {model_index} [GitHub CI/CD, Functional Tests]"
         ModelSchema.set_value(
             model_metadata,
             ModelSchema.SETTINGS_SECTION_KEY,
@@ -244,8 +265,7 @@ def fixture_build_repo_for_testing_factory(
         )
 
         if dedicated_definition:
-            with open(model_metadata_yaml_filepath, "w", encoding="utf-8") as writer:
-                yaml.safe_dump(model_metadata, writer)
+            save_new_metadata(model_metadata, model_metadata_yaml_filepath)
         else:
             # The definition will be written in a single multi-models definition.
             os.remove(model_metadata_yaml_filepath)
@@ -258,13 +278,23 @@ def fixture_build_repo_for_testing_factory(
         deployment_yaml_filepath = next(dst_deployments_dir.glob("deployment.yaml"))
         with open(deployment_yaml_filepath, encoding="utf-8") as fd:
             deployment_metadata = yaml.safe_load(fd)
+
+        # Set Deployment ID
+        namespace = FUNCTIONAL_TESTS_NAMESPACE.format(github_repository_id)
+        origin_deployment_id = deployment_metadata[DeploymentSchema.DEPLOYMENT_ID_KEY]
+        unique_string = unique_str()
+        new_deployment_id = f"{namespace}/{origin_deployment_id}-{unique_string}"
+        DeploymentSchema.set_value(
+            deployment_metadata, DeploymentSchema.DEPLOYMENT_ID_KEY, value=new_deployment_id
+        )
+
+        # Set model ID
         DeploymentSchema.set_value(
             deployment_metadata,
             DeploymentSchema.MODEL_ID_KEY,
             value=models_meta[0].metadata[ModelSchema.MODEL_ID_KEY],
         )
-        with open(deployment_yaml_filepath, "w", encoding="utf-8") as fd:
-            yaml.safe_dump(deployment_metadata, fd)
+        save_new_metadata(deployment_metadata, deployment_yaml_filepath)
 
     def _save_multi_models_metadata_yaml_file(
         dst_deployments_dir, models_meta, is_absolute_model_path, model_path_prefix
@@ -284,8 +314,7 @@ def fixture_build_repo_for_testing_factory(
                     ModelSchema.MODEL_ENTRY_PATH_KEY: model_path,
                 }
             )
-        with open(dst_deployments_dir / "models.yaml", "w", encoding="utf-8") as fd:
-            yaml.safe_dump(multi_models_definition, fd)
+        save_new_metadata(multi_models_definition, dst_deployments_dir / "models.yaml")
 
     def _inner(dedicated_model_definition, is_absolute_model_path=False, model_path_prefix=None):
         src_models_root_dir = Path(__file__).parent / ".." / "models"
@@ -296,7 +325,7 @@ def fixture_build_repo_for_testing_factory(
 
         ModelMeta = namedtuple("ModelMeta", ["metadata", "dst_model_dir_path"])
         models_meta = []
-        for counter in range(1, 3):
+        for counter in range(1, 1 + NUMBER_OF_MODELS_IN_TEST):
             metadata, dst_model_dir_path = _setup_model(
                 src_model_path, dst_models_root_dir, counter, dedicated_model_definition
             )
@@ -332,7 +361,7 @@ def fixture_build_repo_for_testing(build_repo_for_testing_factory):
 
 
 @pytest.fixture
-def set_model_dataset_for_testing(dr_client, model_metadata, model_metadata_yaml_file):
+def set_model_dataset_for_testing(dr_client, git_repo, model_metadata, model_metadata_yaml_file):
     """
     A fixture to temporarily upload and set a model's dataset in a model definition and DataRobot.
     """
@@ -360,12 +389,39 @@ def set_model_dataset_for_testing(dr_client, model_metadata, model_metadata_yaml
                 ModelSchema.TEST_DATA_ID_KEY,
                 new_value=dataset_id,
             ):
+                git_commit_metadata_yaml_file(
+                    git_repo, model_metadata_yaml_file, "Update model's test dataset"
+                )
                 yield dataset_id
         finally:
             if dataset_id:
+                git_commit_metadata_yaml_file(
+                    git_repo, model_metadata_yaml_file, "Update model's test dataset"
+                )
                 dr_client.delete_dataset(dataset_id)
     else:
         yield
+
+
+def git_commit_metadata_yaml_file(git_repo, yaml_file_path, message):
+    """Commit changes to a metadata YAML file."""
+
+    git_repo.git.add(yaml_file_path)
+    git_repo.git.commit("-m", message)
+
+
+def save_new_metadata(metadata, yaml_file_path):
+    """Save a new model/deployment metadata."""
+
+    with open(yaml_file_path, "w", encoding="utf-8") as fd:
+        yaml.safe_dump(metadata, fd)
+
+
+def save_new_metadata_and_commit(metadata, yaml_file_path, git_repo, message):
+    """Save a new model/deployment metadata and commit with a given message."""
+
+    save_new_metadata(metadata, yaml_file_path)
+    git_commit_metadata_yaml_file(git_repo, yaml_file_path, message)
 
 
 @contextlib.contextmanager
@@ -382,7 +438,9 @@ def temporarily_replace_metadata_value(schema_cls, metadata, key, *sub_keys, new
 
 
 @pytest.fixture
-def set_deployment_actuals_dataset(dr_client, deployment_metadata, deployment_metadata_yaml_file):
+def set_deployment_actuals_dataset(
+    dr_client, git_repo, deployment_metadata, deployment_metadata_yaml_file
+):
     """
     A fixture to temporarily upload and set a deployment's dataset in a deployment definition and
     DataRobot.
@@ -419,36 +477,50 @@ def set_deployment_actuals_dataset(dr_client, deployment_metadata, deployment_me
                 DeploymentSchema.ASSOCIATION_ACTUALS_DATASET_ID_KEY,
                 new_value=dataset_id,
             ):
+                git_commit_metadata_yaml_file(
+                    git_repo, deployment_metadata_yaml_file, "Update deployment's actuals dataset"
+                )
                 yield dataset_id
         finally:
             if dataset_id:
+                git_commit_metadata_yaml_file(
+                    git_repo, deployment_metadata_yaml_file, "Update deployment's actuals dataset"
+                )
                 dr_client.delete_dataset(dataset_id)
     else:
         yield
 
 
+def replace_and_store_schema(yaml_filepath, *keys, metadata_or_value):
+    """
+    A helper method to replace and save either a provided complete metadata or a single value
+    of a metadata.
+    """
+
+    with open(yaml_filepath, encoding="utf-8") as fd:
+        origin_metadata = yaml.safe_load(fd)
+
+    if keys:  # Assuming a value replacement
+        new_metadata = copy.deepcopy(origin_metadata)
+        SharedSchema.set_value(new_metadata, *keys, value=metadata_or_value)
+    else:  # Assuming a metadata replacement
+        new_metadata = metadata_or_value
+
+    save_new_metadata(new_metadata, yaml_filepath)
+    return origin_metadata, new_metadata
+
+
 @contextlib.contextmanager
 def _temporarily_replace_schema(yaml_filepath, *keys, metadata_or_value):
+    origin_metadata = None
     try:
-        origin_metadata = None
-        with open(yaml_filepath, encoding="utf-8") as fd:
-            origin_metadata = yaml.safe_load(fd)
-
-        if keys:  # Assuming a value replacement
-            new_metadata = copy.deepcopy(origin_metadata)
-            SharedSchema.set_value(new_metadata, *keys, value=metadata_or_value)
-        else:  # Assuming a metadata replacement
-            new_metadata = metadata_or_value
-
-        with open(yaml_filepath, "w", encoding="utf-8") as fd:
-            yaml.safe_dump(new_metadata, fd)
-
+        origin_metadata, new_metadata = replace_and_store_schema(
+            yaml_filepath, *keys, metadata_or_value=metadata_or_value
+        )
         yield new_metadata
-
     finally:
         if origin_metadata:
-            with open(yaml_filepath, "w", encoding="utf-8") as fd:
-                yaml.safe_dump(origin_metadata, fd)
+            save_new_metadata(origin_metadata, yaml_filepath)
 
 
 @contextlib.contextmanager
@@ -470,38 +542,80 @@ def temporarily_replace_schema_value(yaml_filepath, key, *sub_keys, new_value):
 
 
 @pytest.fixture
-def skip_model_testing(model_metadata, model_metadata_yaml_file):
+def skip_model_testing(git_repo, numbered_model_metadata, numbered_model_metadata_yaml_file):
     """A fixture to skip model testing in DataRobot."""
 
-    origin_test_section = model_metadata.get(ModelSchema.TEST_KEY)
-    model_metadata.pop(ModelSchema.TEST_KEY, None)
-    with open(model_metadata_yaml_file, "w", encoding="utf-8") as fd:
-        yaml.safe_dump(model_metadata, fd)
+    origin_test_section = []
+    for model_number in range(1, 1 + NUMBER_OF_MODELS_IN_TEST):
+        model_metadata = numbered_model_metadata(model_number)
+        origin_test_section.append(model_metadata.get(ModelSchema.TEST_KEY))
+        model_metadata.pop(ModelSchema.TEST_KEY, None)
+        model_metadata_yaml_file = numbered_model_metadata_yaml_file(model_number)
+        save_new_metadata(model_metadata, model_metadata_yaml_file)
+        git_repo.git.add(model_metadata_yaml_file)
+
+    git_repo.git.commit("-m", "Skip model(s) testing")
 
     yield
 
-    model_metadata[ModelSchema.TEST_KEY] = origin_test_section
-    with open(model_metadata_yaml_file, "w", encoding="utf-8") as fd:
-        yaml.safe_dump(model_metadata, fd)
+    try:
+        for model_number in range(1, 1 + NUMBER_OF_MODELS_IN_TEST):
+            model_metadata = numbered_model_metadata(model_number)
+            model_metadata[ModelSchema.TEST_KEY] = origin_test_section.pop(0)
+            model_metadata_yaml_file = numbered_model_metadata_yaml_file(model_number)
+            save_new_metadata(model_metadata, model_metadata_yaml_file)
+            git_repo.git.add(model_metadata_yaml_file)
+
+        git_repo.git.commit("-m", "Restore model(s) testing section")
+    except StopIteration:
+        # It's a kind of best-effort operation. The test may change the models' hierarchy.
+        pass
 
 
 # NOTE: it was rather better to use the pytest.mark.usefixture for 'build_repo_for_testing'
 # but, it turns out that it doesn't work with fixtures.
-@pytest.fixture(name="model_metadata_yaml_file")
-def fixture_model_metadata_yaml_file(build_repo_for_testing, workspace_path, git_repo):
-    """A fixture to load and return the first defined model in the local source tree."""
+@pytest.fixture(name="numbered_model_metadata_yaml_file")
+def fixture_numbered_model_metadata_yaml_file(build_repo_for_testing, workspace_path, git_repo):
+    """A fixture to load and return a given numbered model in the local source tree."""
     # pylint: disable=unused-argument
 
-    return next(workspace_path.rglob("*_1/model.yaml"))
+    def _inner(model_number):
+        return next(workspace_path.rglob(f"*_{model_number}/model.yaml"))
+
+    return _inner
+
+
+@pytest.fixture(name="model_metadata_yaml_file")
+def fixture_model_metadata_yaml_file(numbered_model_metadata_yaml_file):
+    """A fixture to load and return the first defined model in the local source tree."""
+
+    return numbered_model_metadata_yaml_file(model_number=1)
+
+
+@pytest.fixture(name="numbered_model_metadata")
+def fixture_numbered_model_metadata(numbered_model_metadata_yaml_file):
+    """A fixture to load and return given numbered model metadata from a given yaml definition."""
+
+    def _inner(model_number):
+        with open(numbered_model_metadata_yaml_file(model_number), encoding="utf-8") as fd:
+            raw_metadata = yaml.safe_load(fd)
+            return ModelSchema.validate_and_transform_single(raw_metadata)
+
+    return _inner
 
 
 @pytest.fixture(name="model_metadata")
-def fixture_model_metadata(model_metadata_yaml_file):
+def fixture_model_metadata(numbered_model_metadata):
     """A fixture to load and return model metadata from a given yaml definition."""
 
-    with open(model_metadata_yaml_file, encoding="utf-8") as fd:
-        raw_metadata = yaml.safe_load(fd)
-        return ModelSchema.validate_and_transform_single(raw_metadata)
+    return numbered_model_metadata(model_number=1)
+
+
+@pytest.fixture(name="deployment_metadata_yaml_file")
+def fixture_deployment_metadata_yaml_file(workspace_path, build_repo_for_testing):
+    """A fixture to return a unique deployment from the temporary created local source tree."""
+
+    return next(workspace_path.rglob("**/deployment.yaml"))
 
 
 @pytest.fixture(name="main_branch_name")
@@ -525,7 +639,7 @@ def merge_branch_name():
     return "merge-feature-branch"
 
 
-def increase_model_memory_by_1mb(model_yaml_file):
+def increase_model_memory_by_1mb(git_repo, model_yaml_file, do_commit=True):
     """A method to increase a model's memory in a model definition and save it locally."""
 
     with open(model_yaml_file, encoding="utf-8") as fd:
@@ -538,8 +652,12 @@ def increase_model_memory_by_1mb(model_yaml_file):
         new_memory = f"{num_part+1}{unit}"
         yaml_content[ModelSchema.VERSION_KEY][ModelSchema.MEMORY_KEY] = new_memory
 
-    with open(model_yaml_file, "w", encoding="utf-8") as fd:
-        yaml.safe_dump(yaml_content, fd)
+    if do_commit:
+        save_new_metadata_and_commit(
+            yaml_content, model_yaml_file, git_repo, f"Increase model memory by {memory}"
+        )
+    else:
+        save_new_metadata(yaml_content, model_yaml_file)
 
     return new_memory
 
@@ -577,11 +695,9 @@ def run_github_action(
 
     main_branch_head_sha = main_branch_head_sha or git_repo.head.commit.hexsha
     ref_name = main_branch_name if event_name == "push" else "merge-branch"
-    with github_env_set("GITHUB_REPOSITORY_ID", "1234567"), github_env_set(
-        "GITHUB_WORKSPACE", str(workspace_path)
-    ), github_env_set("GITHUB_SHA", git_repo.commit(main_branch_head_sha).hexsha), github_env_set(
-        "GITHUB_EVENT_NAME", event_name
-    ), github_env_set(
+    with github_env_set("GITHUB_WORKSPACE", str(workspace_path)), github_env_set(
+        "GITHUB_SHA", git_repo.commit(main_branch_head_sha).hexsha
+    ), github_env_set("GITHUB_EVENT_NAME", event_name), github_env_set(
         "GITHUB_SHA", git_repo.commit(main_branch_head_sha).hexsha
     ), github_env_set(
         "GITHUB_BASE_REF", main_branch_name
@@ -589,6 +705,7 @@ def run_github_action(
         "GITHUB_REF_NAME", ref_name
     ):
         datarobot_webserver = os.environ.get("DATAROBOT_WEBSERVER")
+        namespace = FUNCTIONAL_TESTS_NAMESPACE.format(GitHubEnv.repository_id())
         args = [
             "--webserver",
             datarobot_webserver,
@@ -597,7 +714,7 @@ def run_github_action(
             "--branch",
             main_branch_name,
             "--namespace",
-            FUNCTIONAL_TESTS_NAMESPACE,
+            namespace,
             "--allow-model-deletion",
         ]
 
@@ -617,7 +734,9 @@ def run_github_action(
 
 
 @contextlib.contextmanager
-def upload_and_update_dataset(dr_client, dataset_filepath, metadata_yaml_filepath, *settings_keys):
+def upload_and_update_dataset(
+    dr_client, dataset_filepath, metadata_yaml_filepath, section_key, *sub_keys
+):
     """
     Upload and update a dataset in a settings section, then yield. Upon return, it deletes the
     dataset from DataRobot.
@@ -628,8 +747,8 @@ def upload_and_update_dataset(dr_client, dataset_filepath, metadata_yaml_filepat
         dataset_id = dr_client.upload_dataset(dataset_filepath)
         with temporarily_replace_schema_value(
             metadata_yaml_filepath,
-            SharedSchema.SETTINGS_SECTION_KEY,
-            *settings_keys,
+            section_key,
+            *sub_keys,
             new_value=dataset_id,
         ):
             yield dataset_id
@@ -640,7 +759,7 @@ def upload_and_update_dataset(dr_client, dataset_filepath, metadata_yaml_filepat
 
 @contextlib.contextmanager
 def temporarily_upload_training_dataset_for_structured_model(
-    dr_client, model_metadata_yaml_file, event_name="pull_request"
+    dr_client, model_metadata_yaml_file, is_model_level, event_name
 ):
     """A method to temporarily upload a training dataset for a structured model."""
 
@@ -652,17 +771,30 @@ def temporarily_upload_training_dataset_for_structured_model(
         training_and_holdout_dataset_filepath = (
             datasets_root / "juniors_3_year_stats_regression_structured_training_with_holdout.csv"
         )
+        section_key = (
+            ModelSchema.SETTINGS_SECTION_KEY if is_model_level else ModelSchema.VERSION_KEY
+        )
         with upload_and_update_dataset(
             dr_client,
             training_and_holdout_dataset_filepath,
             model_metadata_yaml_file,
+            section_key,
             ModelSchema.TRAINING_DATASET_ID_KEY,
         ) as training_dataset_id:
             partition_column = "partitioning"
             with temporarily_replace_schema_value(
                 model_metadata_yaml_file,
-                ModelSchema.SETTINGS_SECTION_KEY,
+                section_key,
                 ModelSchema.PARTITIONING_COLUMN_KEY,
                 new_value=partition_column,
             ):
                 yield training_dataset_id, partition_column
+
+
+@pytest.fixture
+def cleanup(dr_client, workspace_path):
+    """A fixture to delete models in DataRobot that were created from the local source tree."""
+
+    yield
+
+    cleanup_models(dr_client, workspace_path)

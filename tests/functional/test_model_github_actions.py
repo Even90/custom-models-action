@@ -12,39 +12,24 @@ are skipped.
 """
 
 import contextlib
-import glob
 import os
 import shutil
-from enum import Enum
-from pathlib import Path
+from collections import namedtuple
 
 import pytest
-import yaml
 
 from common.convertors import MemoryConvertor
-from common.exceptions import DataRobotClientError
-from dr_client import DrClient
+from common.github_env import GitHubEnv
+from dr_api_attrs import DrApiModelSettings
 from schema_validator import ModelSchema
 from tests.conftest import unique_str
-from tests.functional.conftest import cleanup_models
+from tests.functional.conftest import NUMBER_OF_MODELS_IN_TEST
 from tests.functional.conftest import increase_model_memory_by_1mb
 from tests.functional.conftest import printout
 from tests.functional.conftest import run_github_action
+from tests.functional.conftest import save_new_metadata_and_commit
 from tests.functional.conftest import temporarily_replace_schema_value
-from tests.functional.conftest import (
-    temporarily_upload_training_dataset_for_structured_model,
-)
-from tests.functional.conftest import upload_and_update_dataset
 from tests.functional.conftest import webserver_accessible
-
-
-@pytest.fixture
-def cleanup(dr_client, workspace_path):
-    """A fixture to delete models in DataRobot that were created from the local source tree."""
-
-    yield
-
-    cleanup_models(dr_client, workspace_path)
 
 
 @pytest.mark.skipif(not webserver_accessible(), reason="DataRobot webserver is not accessible.")
@@ -52,13 +37,7 @@ def cleanup(dr_client, workspace_path):
 class TestModelGitHubActions:
     """Contains an end-to-end test cases for the custom inference model GitHub action."""
 
-    class Change(Enum):
-        """An enum to indicate the type of change."""
-
-        INCREASE_MEMORY = 1
-        ADD_FILE = 2
-        REMOVE_FILE = 3
-        DELETE_MODEL = 4
+    ExpectedChange = namedtuple("ExpectedChange", ["settings_updated", "version_created"])
 
     @staticmethod
     @contextlib.contextmanager
@@ -90,9 +69,28 @@ class TestModelGitHubActions:
         executed from a pull request branch with multiple commits.
         """
 
+        assert NUMBER_OF_MODELS_IN_TEST >= 2, (
+            "The given test requires at least 2 models in order to validate expected git model "
+            "versions."
+        )
+
+        printout("Create models as a prerequisite for this test")
+        run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
+
+        origin_commit_sha = git_repo.head.commit.hexsha
+        self._validate_git_model_version(
+            dr_client, git_repo, origin_commit_sha, in_feature_branch=False, model_created=True
+        )
+
         printout("Create a feature branch ...")
         feature_branch = git_repo.create_head(feature_branch_name)
-        checks = [self._increase_memory_check, self._add_file_check, self._remove_file_check]
+        checks = [
+            self._increase_memory_check,
+            self._rename_model,
+            self._add_file_check,
+            self._remove_file_check,
+            self._add_registered_model,
+        ]
         self._run_checks(
             checks,
             feature_branch,
@@ -103,6 +101,7 @@ class TestModelGitHubActions:
             model_metadata_yaml_file,
             merge_branch_name,
             dr_client,
+            origin_commit_sha,
         )
         self._run_github_action_with_testing_enabled(
             dr_client,
@@ -113,6 +112,67 @@ class TestModelGitHubActions:
             model_metadata_yaml_file,
         )
         printout("Done")
+
+    @staticmethod
+    def _validate_git_model_version(
+        dr_client,
+        git_repo,
+        origin_commit_sha,
+        in_feature_branch,
+        model_created=False,
+        settings_updated=False,
+        version_created=False,
+    ):
+        """
+        Validates git model version in custom models and latest versions. The assumption is that
+        there are at least 2 models that are created and any followed changed is done on a single
+        model, whose user provided ID contains the substring '-1-'.
+        """
+
+        if not origin_commit_sha or (settings_updated is None and version_created is None):
+            return
+
+        printout("Validate git model versions.")
+        head_commit_sha = git_repo.head.commit.hexsha
+        custom_models = dr_client.fetch_custom_models()
+        for custom_model in custom_models:
+            user_provided_id = custom_model["userProvidedId"]
+            latest_version = dr_client.fetch_custom_model_latest_version_by_user_provided_id(
+                user_provided_id
+            )
+
+            if model_created:
+                assert head_commit_sha == origin_commit_sha
+                assert head_commit_sha == custom_model["gitModelVersion"]["mainBranchCommitSha"]
+                assert head_commit_sha == latest_version["gitModelVersion"]["mainBranchCommitSha"]
+            else:
+                # Model IDs are indexed starting from '1'
+                if "-1-" not in user_provided_id:
+                    # Unchanged models
+                    assert (
+                        origin_commit_sha == custom_model["gitModelVersion"]["mainBranchCommitSha"]
+                    )
+                    assert (
+                        origin_commit_sha
+                        == latest_version["gitModelVersion"]["mainBranchCommitSha"]
+                    )
+                else:
+                    if in_feature_branch:
+                        sha_ref = "pullRequestCommitSha"
+                        feature_branch_top_commit = git_repo.head.commit.parents[1]
+                        head_commit_sha = feature_branch_top_commit.hexsha
+                    else:
+                        sha_ref = "mainBranchCommitSha"
+
+                    if settings_updated:
+                        assert head_commit_sha == custom_model["gitModelVersion"][sha_ref]
+                    else:
+                        assert head_commit_sha != custom_model["gitModelVersion"][sha_ref]
+
+                    if version_created:
+                        assert head_commit_sha == latest_version["gitModelVersion"][sha_ref]
+                    else:
+                        assert head_commit_sha != latest_version["gitModelVersion"][sha_ref]
 
     @classmethod
     def _run_checks(
@@ -126,6 +186,7 @@ class TestModelGitHubActions:
         model_metadata_yaml_file,
         merge_branch_name,
         dr_client,
+        origin_commit_sha=None,
     ):
         # Make changes, one at a time on a feature branch
         printout("Make several changes on a feature branch, one at a time.")
@@ -138,7 +199,9 @@ class TestModelGitHubActions:
                 # Delete the merge branch to enable creation of another merge branch
                 git_repo.delete_head(merge_branch, "--force")
 
-            with check_method(git_repo, dr_client, model_metadata, model_metadata_yaml_file):
+            with check_method(
+                git_repo, dr_client, model_metadata, model_metadata_yaml_file
+            ) as expected_change:
                 # Create merge branch from master and check it out
                 merge_branch = git_repo.create_head(merge_branch_name, main_branch_name)
                 git_repo.head.reference = merge_branch
@@ -157,17 +220,45 @@ class TestModelGitHubActions:
                     is_deploy=False,
                     # main_branch_head_sha=merge_branch_name,
                 )
+                cls._validate_git_model_version(
+                    dr_client,
+                    git_repo,
+                    origin_commit_sha,
+                    in_feature_branch=True,
+                    settings_updated=expected_change.settings_updated,
+                    version_created=expected_change.version_created,
+                )
+
         cls._merge_changes_into_the_main_branch(git_repo, merge_branch)
 
-    @staticmethod
-    @contextlib.contextmanager
-    def _increase_memory_check(git_repo, dr_client, model_metadata, model_metadata_yaml_file):
-        printout("Increase the model memory ...")
-        new_memory = increase_model_memory_by_1mb(model_metadata_yaml_file)
-        git_repo.git.add(model_metadata_yaml_file)
-        git_repo.git.commit("-m", f"Increase memory to {new_memory}")
+        # Note: in GitHub, as part of a merging process to the main branch, a PUSH event is also
+        # triggered, which results in the action to be executed.
 
-        yield
+        run_github_action(
+            workspace_path,
+            git_repo,
+            main_branch_name,
+            event_name="push",
+            is_deploy=False,
+        )
+
+        cls._validate_git_model_version(
+            dr_client,
+            git_repo,
+            origin_commit_sha,
+            in_feature_branch=False,
+            settings_updated=True,  # Updated during the PR
+            version_created=True,  # Updated during the PR
+        )
+
+    @classmethod
+    @contextlib.contextmanager
+    def _increase_memory_check(cls, git_repo, dr_client, model_metadata, model_metadata_yaml_file):
+        printout("Increase the model memory ...")
+        new_memory = increase_model_memory_by_1mb(git_repo, model_metadata_yaml_file)
+        model_metadata[ModelSchema.VERSION_KEY][ModelSchema.MEMORY_KEY] = new_memory
+
+        yield cls.ExpectedChange(settings_updated=False, version_created=True)
 
         printout("Validate the increase memory check")
         cm_version = dr_client.fetch_custom_model_latest_version_by_user_provided_id(
@@ -178,11 +269,31 @@ class TestModelGitHubActions:
 
     @classmethod
     @contextlib.contextmanager
+    def _rename_model(cls, git_repo, dr_client, model_metadata, model_metadata_yaml_file):
+        printout("Rename model label ...")
+        origin_name = model_metadata[ModelSchema.SETTINGS_SECTION_KEY][ModelSchema.NAME_KEY]
+        model_metadata[ModelSchema.SETTINGS_SECTION_KEY][
+            ModelSchema.NAME_KEY
+        ] = f"{origin_name}-new"
+        save_new_metadata_and_commit(
+            model_metadata, model_metadata_yaml_file, git_repo, "Change model's label"
+        )
+
+        yield cls.ExpectedChange(settings_updated=True, version_created=False)
+
+        printout("Validate model renaming")
+        model = dr_client.fetch_custom_model_by_git_id(model_metadata[ModelSchema.MODEL_ID_KEY])
+        assert (
+            model["name"] == model_metadata[ModelSchema.SETTINGS_SECTION_KEY][ModelSchema.NAME_KEY]
+        )
+
+    @classmethod
+    @contextlib.contextmanager
     def _add_file_check(cls, git_repo, dr_client, model_metadata, model_metadata_yaml_file):
         with cls._add_remove_file_check(
             dr_client, git_repo, model_metadata, model_metadata_yaml_file, is_add=True
         ):
-            yield
+            yield cls.ExpectedChange(settings_updated=False, version_created=True)
 
     @classmethod
     @contextlib.contextmanager
@@ -190,12 +301,12 @@ class TestModelGitHubActions:
         with cls._add_remove_file_check(
             dr_client, git_repo, model_metadata, model_metadata_yaml_file, is_add=False
         ):
-            yield
+            yield cls.ExpectedChange(settings_updated=False, version_created=True)
 
-    @staticmethod
+    @classmethod
     @contextlib.contextmanager
     def _add_remove_file_check(
-        dr_client, git_repo, model_metadata, model_metadata_yaml_file, is_add=True
+        cls, dr_client, git_repo, model_metadata, model_metadata_yaml_file, is_add=True
     ):
         printout("Add a new file to the mode ...")
 
@@ -213,7 +324,7 @@ class TestModelGitHubActions:
         commit_msg = "Add new files." if is_add else "Remove the files."
         git_repo.git.commit("-m", commit_msg)
 
-        yield
+        yield cls.ExpectedChange(settings_updated=False, version_created=True)
 
         printout("Validate the increase memory check")
         cm_version = dr_client.fetch_custom_model_latest_version_by_user_provided_id(
@@ -222,6 +333,22 @@ class TestModelGitHubActions:
         cm_version_files = [item["filePath"] for item in cm_version["items"]]
         for filepath in files_to_add_and_remove:
             assert (filepath.name in cm_version_files) == is_add
+
+    @classmethod
+    @contextlib.contextmanager
+    def _add_registered_model(cls, git_repo, dr_client, model_metadata, model_metadata_yaml_file):
+        printout("Create new registered model ...")
+        model_metadata.update(
+            {ModelSchema.MODEL_REGISTRY_KEY: {ModelSchema.MODEL_NAME: "registered_model"}}
+        )
+
+        save_new_metadata_and_commit(
+            model_metadata, model_metadata_yaml_file, git_repo, "Add registered model"
+        )
+
+        yield cls.ExpectedChange(settings_updated=False, version_created=False)
+
+        assert dr_client.get_registered_model_by_name("registered_model") is not None
 
     @staticmethod
     def _merge_changes_into_the_main_branch(git_repo, merge_branch):
@@ -272,6 +399,12 @@ class TestModelGitHubActions:
         which should delete the model in DataRobot.
         """
 
+        # Used to validate git commit version info in model/model-version entities
+        origin_commit_sha = git_repo.head.commit.hexsha
+
+        printout("Create models as a prerequisite for this test")
+        run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
+
         # Create a feature branch
         printout("Create a feature branch ...")
         feature_branch = git_repo.create_head(feature_branch_name)
@@ -289,6 +422,7 @@ class TestModelGitHubActions:
             model_metadata_yaml_file,
             merge_branch_name,
             dr_client,
+            origin_commit_sha,
         )
 
         printout("Run custom model GitHub action (push event) ...")
@@ -304,223 +438,84 @@ class TestModelGitHubActions:
             )
         printout("Done")
 
-    @staticmethod
+    @classmethod
     @contextlib.contextmanager
-    def _delete_model_check(git_repo, dr_client, model_metadata, model_metadata_yaml_file):
+    def _delete_model_check(cls, git_repo, dr_client, model_metadata, model_metadata_yaml_file):
         # pylint: disable=unused-argument
         printout("Delete the model ...")
         os.remove(model_metadata_yaml_file)
         git_repo.git.add(model_metadata_yaml_file)
         git_repo.git.commit("-m", "Delete the model definition file")
-        yield
+        yield cls.ExpectedChange(settings_updated=False, version_created=False)
 
     @pytest.mark.usefixtures("cleanup")
-    def test_e2e_push_event_with_multiple_changes(
-        self, workspace_path, git_repo, model_metadata_yaml_file, main_branch_name
+    def test_e2e_push_event_with_multiple_changes_and_a_frozen_version_in_between(
+        self,
+        dr_client,
+        workspace_path,
+        git_repo,
+        model_metadata,
+        model_metadata_yaml_file,
+        main_branch_name,
     ):
         """
-        An end-to-end case to test a push event with multiple commits, by the custom
-        inference model GitHub action.
+        An end-to-end case to test multiple commits, each is followed by a push event. In between,
+        a model's package will be created, which means the associated version will be frozen.
+        Consequently, the followed version will be a major update.,
         """
 
+        user_provided_id = model_metadata[ModelSchema.MODEL_ID_KEY]
         # 1. Make three changes, one at a time on the main branch
-        printout("Make 3 changes one at a time on the main branch ...")
-        for index in range(3):
+        printout(
+            "Make 3 changes one at a time on the main branch ... "
+            f"user_provided_id: {user_provided_id}"
+        )
+        prev_latest_version = None
+        sequence_of_create_package_flags = [False, False, True, False, False]
+        for index, create_package in enumerate(sequence_of_create_package_flags):
             # 2. Make a change and commit it
             printout(f"Increase memory ... {index + 1}")
-            new_memory = increase_model_memory_by_1mb(model_metadata_yaml_file)
-            git_repo.git.add(model_metadata_yaml_file)
-            git_repo.git.commit("-m", f"Increase memory to {new_memory}")
+            increase_model_memory_by_1mb(git_repo, model_metadata_yaml_file)
 
             # 3. Run GitHub pull request action
             printout("Run custom model GitHub action (push event) ...")
             run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
+
+            latest_version = dr_client.fetch_custom_model_latest_version_by_user_provided_id(
+                user_provided_id
+            )
+
+            was_package_created_in_prev_iteration = bool(
+                index and sequence_of_create_package_flags[index - 1]
+            )
+            self._validate_major_minor_model_version(
+                prev_latest_version, latest_version, was_package_created_in_prev_iteration
+            )
+            prev_latest_version = latest_version
+
+            if create_package:
+                dr_client.create_model_package_from_custom_model_version(latest_version["id"])
         printout("Done")
+
+    @staticmethod
+    def _validate_major_minor_model_version(
+        prev_latest_version, latest_version, was_package_created_in_prev_iteration
+    ):
+        if prev_latest_version:
+            if was_package_created_in_prev_iteration:
+                assert latest_version["versionMajor"] == prev_latest_version["versionMajor"] + 1
+                assert latest_version["versionMinor"] == 0
+            else:
+                assert latest_version["versionMajor"] == prev_latest_version["versionMajor"]
+                assert latest_version["versionMinor"] == prev_latest_version["versionMinor"] + 1
+        else:
+            assert latest_version["versionMajor"] == 1
+            assert latest_version["versionMinor"] == 0
 
     def test_is_accessible(self):
         """A test case to check whether DataRobot webserver is accessible."""
 
         assert webserver_accessible()
-
-    @pytest.mark.usefixtures("cleanup", "skip_model_testing")
-    def test_e2e_set_training_and_holdout_datasets_for_structured_model(
-        self,
-        dr_client,
-        workspace_path,
-        git_repo,
-        model_metadata,
-        model_metadata_yaml_file,
-        main_branch_name,
-    ):
-        """
-        And end-to-end case to test a training dataset assignment for structured model, by the
-        custom inference model GitHub action. The training dataset contains a holdout column.
-        """
-
-        # 1. Create a model just as a preliminary requirement (use GitHub action)
-        printout(
-            "Create a custom model as a preliminary requirement. "
-            "Run custom model GitHub action (push event) ..."
-        )
-        run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
-
-        with temporarily_upload_training_dataset_for_structured_model(
-            dr_client, model_metadata_yaml_file, event_name="push"
-        ) as (training_dataset_id, partition_column):
-            try:
-                git_repo.git.add(model_metadata_yaml_file)
-                git_repo.git.commit("-m", "Update training / holdout dataset(s)")
-
-                printout("Run custom inference models GitHub action ...")
-                run_github_action(
-                    workspace_path, git_repo, main_branch_name, "push", is_deploy=False
-                )
-
-                # Validate
-                user_provided_id = ModelSchema.get_value(model_metadata, ModelSchema.MODEL_ID_KEY)
-                custom_model = dr_client.fetch_custom_model_by_git_id(user_provided_id)
-                assert custom_model["trainingDatasetId"] == training_dataset_id
-                assert custom_model["trainingDataPartitionColumn"] == partition_column
-            finally:
-                cleanup_models(dr_client, workspace_path)
-
-        printout("Done")
-
-    @pytest.mark.usefixtures("cleanup", "skip_model_testing")
-    def test_e2e_set_training_dataset_with_wrong_model_target_name(
-        self,
-        dr_client,
-        workspace_path,
-        git_repo,
-        model_metadata,
-        model_metadata_yaml_file,
-        main_branch_name,
-    ):
-        """
-        And end-to-end case to test a training dataset assignment for structured model, whose
-        definition initially contains wrong target name.
-        """
-
-        with temporarily_upload_training_dataset_for_structured_model(
-            dr_client, model_metadata_yaml_file, event_name="push"
-        ) as (training_dataset_id, partition_column):
-            try:
-                git_repo.git.add(model_metadata_yaml_file)
-                git_repo.git.commit("-m", "Update training / holdout dataset(s)")
-
-                printout(
-                    "Create a custom model with wrong target name. "
-                    "Run custom model GitHub action (push event) ..."
-                )
-
-                with temporarily_replace_schema_value(
-                    model_metadata_yaml_file,
-                    ModelSchema.SETTINGS_SECTION_KEY,
-                    ModelSchema.TARGET_NAME_KEY,
-                    new_value="wrong-target-name",
-                ):
-                    git_repo.git.add(model_metadata_yaml_file)
-                    git_repo.git.commit("-m", "Set wrong target name")
-
-                    with pytest.raises(DataRobotClientError) as ex:
-                        run_github_action(
-                            workspace_path, git_repo, main_branch_name, "push", is_deploy=False
-                        )
-                    assert ex.value.code == 422, ex.value
-                    assert (
-                        "Custom model's target is not found in the provided dataset"
-                        in ex.value.args[0]
-                    ), ex.value.args
-
-                git_repo.git.add(model_metadata_yaml_file)
-                git_repo.git.commit("-m", "Set valid target name")
-
-                printout("Run custom inference models GitHub action with proper target ...")
-                run_github_action(
-                    workspace_path, git_repo, main_branch_name, "push", is_deploy=False
-                )
-
-                # Validate
-                user_provided_id = ModelSchema.get_value(model_metadata, ModelSchema.MODEL_ID_KEY)
-                custom_model = dr_client.fetch_custom_model_by_git_id(user_provided_id)
-                assert custom_model["trainingDatasetId"] == training_dataset_id
-                assert custom_model["trainingDataPartitionColumn"] == partition_column
-            finally:
-                cleanup_models(dr_client, workspace_path)
-
-        printout("Done")
-
-    @pytest.mark.usefixtures("cleanup", "skip_model_testing")
-    def test_e2e_set_training_and_holdout_datasets_for_unstructured_model(
-        self,
-        dr_client,
-        workspace_path,
-        git_repo,
-        model_metadata,
-        model_metadata_yaml_file,
-        main_branch_name,
-    ):
-        """
-        An end-to-end case to test training and holdout dataset assignment for unstructured
-        model by the custom inference model GitHub action.
-        """
-
-        with temporarily_replace_schema_value(
-            model_metadata_yaml_file,
-            ModelSchema.TARGET_TYPE_KEY,
-            new_value=ModelSchema.TARGET_TYPE_UNSTRUCTURED_OTHER_KEY,
-        ):
-            # 1. Create a model just as a preliminary requirement (use GitHub action)
-            printout(
-                "Create a custom model as a preliminary requirement. "
-                "Run custom model GitHub action (push event) ..."
-            )
-            run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
-
-            user_provided_id = ModelSchema.get_value(model_metadata, ModelSchema.MODEL_ID_KEY)
-
-            printout("Upload training and holdout datasets for unstructured model.")
-            datasets_root = Path(__file__).parent / ".." / "datasets"
-            training_dataset_filepath = (
-                datasets_root / "juniors_3_year_stats_regression_unstructured_training.csv"
-            )
-            holdout_dataset_filepath = (
-                datasets_root / "juniors_3_year_stats_regression_unstructured_holdout.csv"
-            )
-            with upload_and_update_dataset(
-                dr_client,
-                training_dataset_filepath,
-                model_metadata_yaml_file,
-                ModelSchema.TRAINING_DATASET_ID_KEY,
-            ) as training_dataset_id, upload_and_update_dataset(
-                dr_client,
-                holdout_dataset_filepath,
-                model_metadata_yaml_file,
-                ModelSchema.HOLDOUT_DATASET_ID_KEY,
-            ) as holdout_dataset_id:
-                try:
-                    git_repo.git.add(model_metadata_yaml_file)
-                    git_repo.git.commit("-m", "Update training / holdout dataset(s)")
-
-                    printout("Run custom inference models GitHub action ...")
-                    run_github_action(
-                        workspace_path, git_repo, main_branch_name, "push", is_deploy=False
-                    )
-
-                    # Validation
-                    custom_model = dr_client.fetch_custom_model_by_git_id(user_provided_id)
-                    assert (
-                        custom_model["externalMlopsStatsConfig"]["trainingDatasetId"]
-                        == training_dataset_id
-                    )
-                    assert (
-                        custom_model["externalMlopsStatsConfig"]["holdoutDatasetId"]
-                        == holdout_dataset_id
-                    )
-                finally:
-                    cleanup_models(dr_client, workspace_path)
-
-        printout("Done")
 
     @pytest.mark.usefixtures("cleanup", "skip_model_testing")
     def test_e2e_update_model_settings(
@@ -540,10 +535,7 @@ class TestModelGitHubActions:
         user_provided_id = ModelSchema.get_value(model_metadata, ModelSchema.MODEL_ID_KEY)
 
         # 1. Create a model just as a preliminary requirement (use GitHub action)
-        printout(
-            "Create a custom model as a preliminary requirement. "
-            "Run custom model GitHub action (push event) ..."
-        )
+        printout("Create models as a prerequisite for this test")
         run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
 
         unique_string = unique_str()
@@ -555,7 +547,7 @@ class TestModelGitHubActions:
             (ModelSchema.PREDICTION_THRESHOLD_KEY, 0.2),  # Assuming the model type is regression
         ]:
             custom_model = dr_client.fetch_custom_model_by_git_id(user_provided_id)
-            actual_settings_value = custom_model[DrClient.MODEL_SETTINGS_KEYS_MAP[settings_key]]
+            actual_settings_value = custom_model[DrApiModelSettings.to_dr_attr(settings_key)]
             assert desired_settings_value != actual_settings_value, (
                 f"Desired settings value '{desired_settings_value}' should be differ than the "
                 f"actual '{actual_settings_value}'."
@@ -577,11 +569,147 @@ class TestModelGitHubActions:
 
                 # Validate
                 custom_model = dr_client.fetch_custom_model_by_git_id(user_provided_id)
-                actual_settings_value = custom_model[DrClient.MODEL_SETTINGS_KEYS_MAP[settings_key]]
+                actual_settings_value = custom_model[DrApiModelSettings.to_dr_attr(settings_key)]
                 assert desired_settings_value == actual_settings_value, (
                     f"Desired settings value '{desired_settings_value}' should be equal to the "
                     f"actual '{actual_settings_value}'."
                 )
+
+    # pylint: disable=too-many-locals
+    @pytest.mark.usefixtures("cleanup", "skip_model_testing")
+    def test_no_new_model_version_upon_pr_with_unrelated_changes(
+        self,
+        dr_client,
+        workspace_path,
+        git_repo,
+        numbered_model_metadata,
+        numbered_model_metadata_yaml_file,
+        main_branch_name,
+        feature_branch_name,
+        merge_branch_name,
+    ):
+        """
+        This case validates that no new model's version is created by a pull-request that affects
+        another unrelated model. This can happen if the last change for the first model was made
+        to its settings, before the pull-request of the other model was created.
+        """
+
+        # This test requires two models
+        assert NUMBER_OF_MODELS_IN_TEST == 2
+
+        # 1. Create two models as a preliminary requirement (use GitHub action)
+        printout("Create models as a prerequisite for this test")
+        run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
+
+        model_1_metadata = numbered_model_metadata(model_number=1)
+        model_1_metadata_yaml_file = numbered_model_metadata_yaml_file(model_number=1)
+        model_2_metadata = numbered_model_metadata(model_number=2)
+        model_2_metadata_yaml_file = numbered_model_metadata_yaml_file(model_number=2)
+
+        # 2. Retrieve the models from DataRobot
+        model_1_user_provided_id = model_1_metadata[ModelSchema.MODEL_ID_KEY]
+        dr_model_1 = dr_client.fetch_custom_model_by_git_id(model_1_user_provided_id)
+        custom_model_1_name = dr_model_1[DrApiModelSettings.to_dr_attr(ModelSchema.NAME_KEY)]
+        custom_model_1_origin_version_id = dr_model_1["latestVersion"]["id"]
+
+        model_2_user_provided_id = model_2_metadata[ModelSchema.MODEL_ID_KEY]
+        dr_model_2 = dr_client.fetch_custom_model_by_git_id(model_2_user_provided_id)
+        custom_model_2_origin_version_id = dr_model_2["latestVersion"]["id"]
+
+        # 3. Apply settings change (rename label) to the first model
+        model_1_metadata[ModelSchema.SETTINGS_SECTION_KEY][
+            ModelSchema.NAME_KEY
+        ] = f"{custom_model_1_name}-new"
+        save_new_metadata_and_commit(
+            model_1_metadata,
+            model_1_metadata_yaml_file,
+            git_repo,
+            "Update the name of the first model.",
+        )
+
+        printout("Run custom inference models GitHub action (push) ...")
+        run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
+
+        self._validate_custom_model_action_metrics(
+            expected_num_affected_models=1,
+            expected_num_updated_settings=1,
+            expected_num_created_versions=0,
+        )
+
+        # 4. Validate that no new versions were created in both models
+        dr_model_1 = dr_client.fetch_custom_model_by_git_id(model_1_user_provided_id)
+        assert custom_model_1_origin_version_id == dr_model_1["latestVersion"]["id"]
+        dr_model_2 = dr_client.fetch_custom_model_by_git_id(model_2_user_provided_id)
+        assert custom_model_2_origin_version_id == dr_model_2["latestVersion"]["id"]
+
+        # 5. Create a feature-branch
+        printout("Create a feature branch and checkout ...")
+        feature_branch = git_repo.create_head(feature_branch_name)
+
+        # 6. Make a memory change to the second model and merge back.
+        checks = [self._increase_memory_check]
+        self._run_checks(
+            checks,
+            feature_branch,
+            git_repo,
+            workspace_path,
+            main_branch_name,
+            model_2_metadata,
+            model_2_metadata_yaml_file,
+            merge_branch_name,
+            dr_client,
+        )
+
+        # All the changes in DataRobot were accomplished during the PR, so it is not expected to
+        # have any affected model after merging to the main branch.
+        self._validate_custom_model_action_metrics(
+            expected_num_affected_models=0,
+            expected_num_updated_settings=0,
+            expected_num_created_versions=0,
+        )
+
+        # 4. Validate that a new version was only created to the second model
+        dr_model_1 = dr_client.fetch_custom_model_by_git_id(model_1_user_provided_id)
+        assert custom_model_1_origin_version_id == dr_model_1["latestVersion"]["id"]
+        dr_model_2 = dr_client.fetch_custom_model_by_git_id(model_2_user_provided_id)
+        assert custom_model_2_origin_version_id != dr_model_2["latestVersion"]["id"]
+
+    @staticmethod
+    def _validate_custom_model_action_metrics(
+        expected_num_affected_models, expected_num_updated_settings, expected_num_created_versions
+    ):
+        github_output_filepath = GitHubEnv.github_output()
+        with open(github_output_filepath, encoding="utf-8") as file:
+            lines = file.readlines()
+
+        index = 0
+        actual_num_affected_models = None
+        actual_num_updated_settings = None
+        actual_num_created_versions = None
+        for line in reversed(lines):
+            key, value = line.strip().split("=")
+            if key.startswith("models--total-affected"):
+                actual_num_affected_models = int(value)
+                index += 1
+            elif key.startswith("models--total-updated-settings"):
+                actual_num_updated_settings = int(value)
+                index += 1
+            elif key.startswith("models--total-created-versions"):
+                actual_num_created_versions = int(value)
+                index += 1
+
+            if index == 3:
+                break
+
+        assert actual_num_affected_models == expected_num_affected_models
+        assert actual_num_updated_settings == expected_num_updated_settings
+        assert actual_num_created_versions == expected_num_created_versions
+
+    @staticmethod
+    def _print_custom_model_action_metrics():
+        github_output_filepath = GitHubEnv.github_output()
+        with open(github_output_filepath, encoding="utf-8") as file:
+            print(file.read())
 
     @pytest.fixture
     def dependency_package_name(self):
@@ -633,60 +761,3 @@ class TestModelGitHubActions:
 
         build_info = dr_client.get_custom_model_version_dependency_build_info(cm_version)
         assert build_info["buildStatus"] == "success"
-
-
-# pylint: disable=too-few-public-methods
-@pytest.mark.skipif(not webserver_accessible(), reason="DataRobot webserver is not accessible.")
-@pytest.mark.usefixtures("github_output", "cleanup")
-class TestMultiModelsOneDefinitionGitHubAction:
-    """A class to test multi-models definition in a single metadata YAML file"""
-
-    @pytest.mark.parametrize(
-        "is_abs_model_path, model_path_prefix", [(True, "/"), (True, "$ROOT/"), (False, None)]
-    )
-    def test_e2e_pull_request_event_with_multi_model_definition(
-        self,
-        dr_client,
-        workspace_path,
-        git_repo,
-        main_branch_name,
-        build_repo_for_testing_factory,
-        is_abs_model_path,
-        model_path_prefix,
-    ):
-        """
-        An end-to-end case to test model deletion by the custom inference model GitHub action
-        from a pull-request. The test first creates a PR with a simple change in order to create
-        the model in DataRobot. Afterwards, it creates another PR to delete the model definition,
-        which should delete the model in DataRobot.
-        """
-
-        build_repo_for_testing_factory(
-            dedicated_model_definition=False,
-            is_absolute_model_path=is_abs_model_path,
-            model_path_prefix=model_path_prefix,
-        )
-        printout("Run custom model GitHub action (push event) ...")
-        run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=False)
-
-        printout("Validate after merging ...")
-
-        multi_models_metadata = self._load_multi_models_metadata(workspace_path)
-        models = dr_client.fetch_custom_models()
-
-        expected_user_provided_ids = {
-            model_entry[ModelSchema.MODEL_ENTRY_META_KEY][ModelSchema.MODEL_ID_KEY]
-            for model_entry in multi_models_metadata[ModelSchema.MULTI_MODELS_KEY]
-        }
-        actual_user_provided_ids = {model.get("userProvidedId") for model in models}
-        assert expected_user_provided_ids <= actual_user_provided_ids
-        printout("Done")
-
-    @staticmethod
-    def _load_multi_models_metadata(workspace_path):
-        multi_models_yaml_filepath = glob.glob(str(workspace_path / "**/models.yaml"))
-        assert len(multi_models_yaml_filepath) == 1
-        multi_models_yaml_filepath = multi_models_yaml_filepath[0]
-        with open(multi_models_yaml_filepath, encoding="utf-8") as fd:
-            multi_models_metadata = ModelSchema.validate_and_transform_multi(yaml.safe_load(fd))
-        return multi_models_metadata

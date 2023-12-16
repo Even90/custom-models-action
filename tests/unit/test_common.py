@@ -6,6 +6,7 @@
 # pylint: disable=too-many-arguments
 
 """A module that contains unit-tests for the common package."""
+import re
 
 import pytest
 
@@ -14,6 +15,7 @@ from common.exceptions import InvalidMemoryValue
 from common.exceptions import NamespaceAlreadySet
 from common.exceptions import NamespaceNotInitialized
 from common.git_tool import GitTool
+from common.github_env import GitHubEnv
 from common.namepsace import Namespace
 from tests.unit.conftest import make_a_change_and_commit
 
@@ -219,3 +221,55 @@ class TestNamespace:
         un_namespaced_user_provided_id = Namespace.un_namespaced(namespaced_user_provided_id)
         assert not Namespace.un_namespaced(namespaced_user_provided_id).startswith(namespace)
         assert un_namespaced_user_provided_id == user_provided_id
+
+
+@pytest.mark.usefixtures("github_output")
+class TestGitHubEnv:
+    """A class that contains unit-tests for the GitHubEnv module."""
+
+    @pytest.mark.parametrize("value", [1, -1, 0.5, None, [2, 3], (4, 5), {"a": 1}])
+    def test_set_output_param_non_str_value(self, value):
+        """A case to test non-strings output values."""
+
+        param_name = "some-non-str-value-param"
+        GitHubEnv.set_output_param(param_name, value)
+        with open(GitHubEnv.github_output(), "r", encoding="utf-8") as fd:
+            content = fd.read()
+            assert f"{param_name}={value}" in content
+
+    @pytest.mark.parametrize("value", ["Hello", "Hello World", "\nHello World\n\n"])
+    def test_set_output_param_single_line_str_value(self, value):
+        """A case to test single line string output values."""
+
+        param_name = "some-single-line-str-param"
+        GitHubEnv.set_output_param(param_name, value)
+        with open(GitHubEnv.github_output(), "r", encoding="utf-8") as fd:
+            content = fd.read()
+            assert f"{param_name}={value.strip()}" in content
+
+    @pytest.mark.parametrize("value", ["Hello\nWorld", "\n\nHello\nWorld\n"])
+    def test_set_output_param_multilines_str_value(self, value):
+        """A case to test multilines string output values."""
+
+        param_name = "some-multilines-str-param"
+        GitHubEnv.set_output_param(param_name, value)
+        with open(GitHubEnv.github_output(), "r", encoding="utf-8") as fd:
+            content = fd.read()
+
+            expected_block = f"{param_name}<<.*\n{value.strip()}\n.*\n"
+            assert re.search(expected_block, content)
+
+    def test_set_output_param_two_multilines_str_values(self):
+        """A case to test more than one multilines string output values."""
+
+        param_name_prefix = "some-multilines-str-param"
+        value_prefix = "Hello\nWorld"
+        for index in range(2):
+            GitHubEnv.set_output_param(f"{param_name_prefix}-{index}", f"{value_prefix}-{index}")
+
+        with open(GitHubEnv.github_output(), "r", encoding="utf-8") as fd:
+            content = fd.read()
+
+            for index in range(2):
+                expected_block = f"{param_name_prefix}-{index}<<.*\n{value_prefix}-{index}\n.*\n"
+                assert re.search(expected_block, content)

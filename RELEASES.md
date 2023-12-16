@@ -1,5 +1,39 @@
 # RELEASES
 
+## 1.6.0 [2023-07-20]
+* Add support for training/holdout dataset assignment as model version level
+* Internal improvements
+* Bug fixes
+
+## 1.5.0 [2023-07-16]
+* Add support for LLM (text generation) custom models
+* Add support for egress network policy for a custom model
+* Bug fix
+
+## 1.4.2 [2023-06-06]
+* Bug fix
+
+## 1.4.1 [2023-06-01]
+* Bug fixes
+
+## 1.4.0 [2023-05-11]
+  * Enable users to specify a reason for a model replacement in a deployment
+  * Separately track model's settings from its versions
+
+## 1.3.0 [2023-04-27]
+  * Fetch and print deployment's log in case of a deployment's creation failure
+  * Add a missing mapping of Anomaly target type
+  * Internal improvements
+  * Bug fixes
+
+## 1.2.2 [2023-03-21]
+  * Improve segment analysis functionality and update README.md
+  * Bug fix
+
+## 1.2.1 [2023-03-12]
+  * Fix examples in the README.md to comply with the defaults in DataRobot
+  * Internal improvement
+
 ## 1.2.0 [2023-02-20]
   * Add support for namespaces
   * Add a new metric to count models and deployment whose settings were changed

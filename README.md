@@ -55,7 +55,7 @@ DataRobot from a custom model repository in GitHub, take the following steps:
 
           - name: DataRobot Custom Models Step
             id: datarobot-custom-models-step
-            uses: datarobot-oss/custom-models-action@v1.2.0
+            uses: datarobot-oss/custom-models-action@v1.6.0
             with:
               api-token: ${{ secrets.DATAROBOT_API_TOKEN }}
               webserver: https://app.datarobot.com/
@@ -272,17 +272,14 @@ steps in the same GitHub job (refer to the workflow example below):
 
 ### Model Definition
 
-The GitHub action requires the model's metadata in a YAML file. The model's full schema is defined in
-[this source code block](
-https://github.com/datarobot/custom-models-action/blob/62b9df9e8895becabd7592e65c0ed52252690498/src/schema_validator.py#L271
-)
+The GitHub action requires the model's metadata in a YAML file. The model's full schema is defined
+by `MODEL_SCHEMA`, which can be found in [here](src/schema_validator.py).
 
 A model metadata YAML file may contain the schema of a single model's definition
 (as specified above) or the schema of multiple models' definitions.
 
-The **multiple models' schema** is defined in [this source code block](
-https://github.com/datarobot/custom-models-action/blob/62b9df9e8895becabd7592e65c0ed52252690498/src/schema_validator.py#L351
-).
+The **multiple models' schema** is defined by `MULTI_MODELS_SCHEMA`, which can be found in
+[here](src/schema_validator.py).
 
 The single model's definition YAML file must be located inside the model's root directory.
 The multiple models' definition YAML file can be located anywhere in the repository.
@@ -316,16 +313,13 @@ At the top level, there are attributes you cannot change after a model is create
 ### Deployment Definition
 
 The user is required to provide the deployment's metadata in a YAML file. The deployment's full
-schema is defined in [this source code block](
-https://github.com/datarobot/custom-models-action/blob/62b9df9e8895becabd7592e65c0ed52252690498/src/schema_validator.py#L639
-).
+schema is defined by `DEPLOYMENT_SCHEMA`, which can be found in [here](src/schema_validator.py).
 
 A deployment metadata YAML file may contain the schema of a single deployment's definition (as
 specified above) or the schema of multiple deployments' definitions.
 
-The **multiple deployments' schema** is defined in [this source code block](
-https://github.com/datarobot/custom-models-action/blob/62b9df9e8895becabd7592e65c0ed52252690498/src/schema_validator.py#L679
-).
+The **multiple deployments' schema** is defined by `MULTI_DEPLOYMENTS_SCHEMA`, which can be
+found in [here](src/schema_validator.py).
 
 The deployment definition YAML file (single or multiple) can be located anywhere in
 the repository.
@@ -391,7 +385,7 @@ GitHub workflow definition:
 
           - name: DataRobot Custom Models Step
             id: datarobot-custom-models-step
-            uses: datarobot-oss/custom-models-action@v1.2.0
+            uses: datarobot-oss/custom-models-action@v1.6.0
             with:
               api-token: ${{ secrets.DATAROBOT_API_TOKEN }}
               webserver: ${{ secrets.DATAROBOT_WEBSERVER }}
@@ -493,7 +487,8 @@ version:
 
 <details><summary>Full Single Model Definition</summary>
 
-Below is an example of a full model's definition, which includes both mandatory and optional fields:
+Below is an example of a full model's definition, which includes both mandatory and optional fields
+(for the full scheme please refer to `MODEL_SCHEMA` in [here](src/schema_validator.py)):
 
 ```yaml
 user_provided_model_id: user/any-model-unique-id-1
@@ -517,11 +512,13 @@ version:
     - out/
   include_glob_pattern:
     - ./
-  memory: 100Mi
-  replicas: 3
+  memory: 256Mi
+  replicas: 2
+  egress_network_policy: NONE
+  model_replacement_reason: DATA_DRIFT
 
 test:
-  memory: 100Mi
+  memory: 256Mi
   skip: false
   test_data_id: 62779143562155aa34a3d65b
   checks:
@@ -612,7 +609,7 @@ user_provided_model_id: user/any-model-unique-id-1
 <details><summary>Full Single Deployment Definition</summary>
 
 Below is an example of a full deployment's definition, which includes both mandatory and optional
-fields:
+fields (for the full schema please refer to `DEPLOYMENT_SCHEMA` in [here](src/schema_validator.py):
 
 ```yaml
 user_provided_deployment_id: user/my-awesome-deployment-id
@@ -636,9 +633,14 @@ settings:
   enable_challenger_models: true
   segment_analysis:
     enabled: true
-    attributes:
-      - Host-IP
-      - Remote-IP
+    # NOTE: the 'segment_analysis' may contain an 'attributes' section, where users can specify
+    # attributes that are categorical features in the associated model.
+    # Be aware that if you enabled segment analysis, without specifying attribute, you can still
+    # access various statistics by segment of built-in attributes in DataRobot.
+    #
+    # attributes:
+    # - <categorical-attr-1>
+    # - <categorical-attr-2>
 ```
 
 </details>
@@ -694,7 +696,7 @@ jobs:
 
       - name: DataRobot Custom Models Step
         id: datarobot-custom-models-step
-        uses: datarobot-oss/custom-models-action@v1.2.0
+        uses: datarobot-oss/custom-models-action@v1.6.0
         with:
           api-token: ${{ secrets.DATAROBOT_API_TOKEN }}
           webserver: ${{ secrets.DATAROBOT_WEBSERVER }}

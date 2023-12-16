@@ -128,24 +128,24 @@ class DeploymentController(ControllerBase):
 
         logger.info("Validating deployments integrity ...")
         for user_provided_id, deployment_info in self.deployments_info.items():
+            # Verify existing and valid local custom model that is associated with the
+            # deployment.
+            model_info = self._model_controller.models_info.get(
+                deployment_info.user_provided_model_id
+            )
+            if not model_info:
+                raise AssociatedModelNotFound(
+                    "Data integrity in local repository is broken. "
+                    "There's no associated git model definition for given deployment. "
+                    f"User provided deployment id: {user_provided_id}, "
+                    f"User provided model id: {deployment_info.user_provided_model_id}."
+                )
+
             datarobot_deployment = self.datarobot_deployments.get(user_provided_id)
             if datarobot_deployment:
                 model_version = datarobot_deployment.model_version
             else:
-                # 1. Verify existing and valid local custom model that is associated with the
-                #    deployment.
-                model_info = self._model_controller.models_info.get(
-                    deployment_info.user_provided_model_id
-                )
-                if not model_info:
-                    raise AssociatedModelNotFound(
-                        "Data integrity in local repository is broken. "
-                        "There's no associated git model definition for given deployment. "
-                        f"User provided deployment id: {user_provided_id}, "
-                        f"User provided model id: {deployment_info.user_provided_model_id}."
-                    )
-
-                # 2. Validate that the associated model was already created in DataRobot
+                # Validate that the associated model was already created in DataRobot
                 custom_model = self._model_controller.datarobot_models.get(
                     deployment_info.user_provided_model_id
                 )
@@ -156,7 +156,7 @@ class DeploymentController(ControllerBase):
                         f"User provided model id: {deployment_info.user_provided_model_id}."
                     )
 
-                # 3. Validate at least one version
+                # Validate at least one version
                 if not custom_model.latest_version:
                     raise AssociatedModelVersionNotFound(
                         "Unexpected missing DataRobot model version. A custom model with at least "
@@ -167,7 +167,7 @@ class DeploymentController(ControllerBase):
                     )
                 model_version = custom_model.latest_version
 
-            # 4. Validate that the associated model's version SHA is an ancestor in the current tree
+            # Validate that the associated model's version SHA is an ancestor in the current tree
             git_main_branch_sha = model_version["gitModelVersion"]["mainBranchCommitSha"]
             if not self._repo.is_ancestor_of(git_main_branch_sha, "HEAD"):
                 raise NoValidAncestor(
@@ -199,18 +199,31 @@ class DeploymentController(ControllerBase):
                     desired_datarobot_model, datarobot_deployment
                 ):
                     if deployment_info.is_challenger_enabled:
-                        self._conditionally_create_challenger_in_deployment(
+                        self._create_challenger_in_deployment_if_not_created_already(
                             desired_datarobot_model.latest_version,
                             datarobot_deployment,
                             deployment_info,
                         )
                     else:
+                        associated_model_info = self._model_controller.models_info.get(
+                            deployment_info.user_provided_model_id
+                        )
                         self._replace_model_version_in_deployment(
-                            desired_datarobot_model.latest_version, datarobot_deployment
+                            associated_model_info,
+                            desired_datarobot_model.latest_version,
+                            datarobot_deployment,
+                        )
+                        self._reapply_deployment_settings_upon_model_replacement(
+                            deployment_info, datarobot_deployment
                         )
                     updated = True
 
                 if updated:
+                    logger.info(
+                        "Deployment settings were updated, git_id: %s, deployment_id: %s.",
+                        deployment_info.user_provided_id,
+                        datarobot_deployment.deployment["id"],
+                    )
                     self.metrics.total_affected.value += 1
 
     def _create_deployment(self, deployment_info):
@@ -234,7 +247,7 @@ class DeploymentController(ControllerBase):
         deployment, _ = self._dr_client.update_deployment_settings(deployment, deployment_info)
 
         logger.info(
-            "A new deployment was created, git_id: %s, id: %s.",
+            "A new deployment was created, git_id: %s, deployment_id: %s.",
             deployment_info.user_provided_id,
             deployment["id"],
         )
@@ -276,7 +289,9 @@ class DeploymentController(ControllerBase):
     def _there_is_a_new_model_version(datarobot_model, datarobot_deployment):
         return datarobot_deployment.model_version["id"] != datarobot_model.latest_version["id"]
 
-    def _replace_model_version_in_deployment(self, model_latest_version, datarobot_deployment):
+    def _replace_model_version_in_deployment(
+        self, model_info, model_latest_version, datarobot_deployment
+    ):
         user_provided_id = datarobot_deployment.deployment["userProvidedId"]
         logger.info(
             "Replacing a model version in a deployment ... "
@@ -285,7 +300,7 @@ class DeploymentController(ControllerBase):
             model_latest_version["id"],
         )
         deployment = self._dr_client.replace_model_deployment(
-            model_latest_version, datarobot_deployment
+            model_info, model_latest_version, datarobot_deployment
         )
         logger.info(
             "The latest model version was successfully replaced in a deployment. "
@@ -294,23 +309,13 @@ class DeploymentController(ControllerBase):
             deployment["id"],
         )
 
-    def _conditionally_create_challenger_in_deployment(
+    def _create_challenger_in_deployment_if_not_created_already(
         self, model_latest_version, datarobot_deployment, deployment_info
     ):
-        associated_model_info = self._model_controller.models_info.get(
-            deployment_info.user_provided_model_id
-        )
-        if not associated_model_info.is_affected_by_commit(model_latest_version):
-            logger.debug(
-                "Avoid creating a challenger because the associated model was not affected. "
-                "User provided deployment ID: %s, Model path: %s, model latest version id: %s",
-                deployment_info.user_provided_id,
-                associated_model_info.model_path,
-                model_latest_version["id"],
-            )
-            return
-
         if self._challenger_already_created(model_latest_version, datarobot_deployment):
+            associated_model_info = self._model_controller.models_info.get(
+                deployment_info.user_provided_model_id
+            )
             logger.debug(
                 "Avoid creating a challenger because the challenger already exists. "
                 "User provided deployment ID: %s, model path: %s, model latest version id: %s",
@@ -362,6 +367,23 @@ class DeploymentController(ControllerBase):
             self.metrics.total_updated_settings.value += 1
 
         return settings_were_updated
+
+    def _reapply_deployment_settings_upon_model_replacement(
+        self, deployment_info, datarobot_deployment
+    ):
+        """
+        Upon model replacement in a deployment, some deployment's settings (e.g. data drift,
+        target drift, etc.) may be reset in DataRobot. Therefore, it is required to re-apply these
+        configurations.
+        """
+
+        datarobot_deployment_id = datarobot_deployment.deployment["id"]
+        actual_deployment_settings = self._dr_client.fetch_deployment_settings(
+            datarobot_deployment_id, deployment_info
+        )
+        self._dr_client.update_deployment_settings(
+            datarobot_deployment.deployment, deployment_info, actual_deployment_settings
+        )
 
     def handle_deleted_deployments(self):
         """Delete deployments in DataRobot. Deletion takes place only within a push GitHub event."""

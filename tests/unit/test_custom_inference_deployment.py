@@ -429,12 +429,17 @@ class TestCustomInferenceDeployment:
             with self._mock_repo_with_datarobot_models(
                 deployments_factory, git_repo, init_repo_for_root_path_factory
             ):
-                git_tool = GitTool(GitHubEnv.workspace_path())
-                model_controller = ModelController(options, git_tool)
-                deployment_controller = DeploymentController(options, model_controller, git_tool)
-                deployment_controller.scan_and_load_deployments_metadata()
-                deployment_controller.fetch_deployments_from_datarobot()
-                deployment_controller.validate_deployments_integrity()
+                self._setup_and_run_deployment_integrity_validation(options)
+
+    @staticmethod
+    def _setup_and_run_deployment_integrity_validation(options):
+        git_tool = GitTool(GitHubEnv.workspace_path())
+        model_controller = ModelController(options, git_tool)
+        model_controller.scan_and_load_models_metadata()
+        deployment_controller = DeploymentController(options, model_controller, git_tool)
+        deployment_controller.scan_and_load_deployments_metadata()
+        deployment_controller.fetch_deployments_from_datarobot()
+        deployment_controller.validate_deployments_integrity()
 
     @pytest.mark.usefixtures("workspace_path")
     def test_deployments_integrity_validation_no_dr_deployments(
@@ -450,13 +455,7 @@ class TestCustomInferenceDeployment:
             init_repo_for_root_path_factory,
             with_dr_deployments=False,
         ):
-            git_tool = GitTool(GitHubEnv.workspace_path())
-            model_controller = ModelController(options, git_tool)
-            model_controller.scan_and_load_models_metadata()
-            deployment_controller = DeploymentController(options, model_controller, git_tool)
-            deployment_controller.scan_and_load_deployments_metadata()
-            deployment_controller.fetch_deployments_from_datarobot()
-            deployment_controller.validate_deployments_integrity()
+            self._setup_and_run_deployment_integrity_validation(options)
 
     @pytest.mark.usefixtures("no_deployments")
     def test_save_statistics(self, options, github_output):
@@ -502,14 +501,8 @@ class TestCustomInferenceDeployment:
             with_associated_dr_models=True,
             with_latest_dr_model_version=False,
         ):
-            git_tool = GitTool(GitHubEnv.workspace_path())
-            model_controller = ModelController(options, git_tool)
-            model_controller.scan_and_load_models_metadata()
-            deployment_controller = DeploymentController(options, model_controller, git_tool)
-            deployment_controller.scan_and_load_deployments_metadata()
-            deployment_controller.fetch_deployments_from_datarobot()
             with pytest.raises(AssociatedModelVersionNotFound):
-                deployment_controller.validate_deployments_integrity()
+                self._setup_and_run_deployment_integrity_validation(options)
 
     @pytest.mark.usefixtures("workspace_path")
     def test_deployments_integrity_validation_no_main_branch_sha_failure(
@@ -523,13 +516,8 @@ class TestCustomInferenceDeployment:
             init_repo_for_root_path_factory,
             with_main_branch_sha=False,
         ):
-            git_tool = GitTool(GitHubEnv.workspace_path())
-            model_controller = ModelController(options, git_tool)
-            deployment_controller = DeploymentController(options, model_controller, git_tool)
-            deployment_controller.scan_and_load_deployments_metadata()
-            deployment_controller.fetch_deployments_from_datarobot()
             with pytest.raises(NoValidAncestor):
-                deployment_controller.validate_deployments_integrity()
+                self._setup_and_run_deployment_integrity_validation(options)
 
 
 class TestDeploymentChanges:
@@ -653,7 +641,7 @@ class TestDeploymentChanges:
             "datarobot_models",
             new_callable=PropertyMock(return_value={new_model_id: new_datarobot_model}),
         ), patch.object(
-            DeploymentController, "_conditionally_create_challenger_in_deployment"
+            DeploymentController, "_create_challenger_in_deployment_if_not_created_already"
         ) as create_challenger_in_deployment_method:
             model_controller = ModelController(options, None)
             custom_inference_deployment = DeploymentController(options, model_controller, None)
@@ -698,7 +686,7 @@ class TestDeploymentChanges:
             "datarobot_models",
             new_callable=PropertyMock(return_value={model_id: datarobot_model_with_new_latest}),
         ), patch.object(
-            DeploymentController, "_conditionally_create_challenger_in_deployment"
+            DeploymentController, "_create_challenger_in_deployment_if_not_created_already"
         ) as create_challenger_in_deployment_method:
             model_controller = ModelController(options, None)
             deployment_controller = DeploymentController(options, model_controller, None)

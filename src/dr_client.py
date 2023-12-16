@@ -15,7 +15,6 @@ communicates with DataRobot via the published public API.
 import json
 import logging
 import time
-from collections import namedtuple
 
 from requests_toolbelt import MultipartEncoder
 
@@ -27,7 +26,9 @@ from common.exceptions import IllegalModelDeletion
 from common.http_requester import HttpRequester
 from common.namepsace import Namespace
 from common.string_util import StringUtil
-from dr_api_attrs import DrApiAttrs
+from dr_api_attrs import DrApiCustomModelChecks
+from dr_api_attrs import DrApiModelSettings
+from dr_api_attrs import DrApiTargetType
 from schema_validator import DeploymentSchema
 from schema_validator import ModelSchema
 
@@ -40,6 +41,9 @@ class DrClient:
     CUSTOM_MODELS_ROUTE = "customModels/"
     CUSTOM_MODEL_ROUTE = CUSTOM_MODELS_ROUTE + "{model_id}/"
     CUSTOM_MODELS_VERSIONS_ROUTE = CUSTOM_MODEL_ROUTE + "versions/"
+    CUSTOM_MODELS_VERSIONS_CREATE_WITH_TRAINING_DATA_ROUTE = (
+        CUSTOM_MODEL_ROUTE + "versions/withTrainingData"
+    )
     CUSTOM_MODELS_VERSION_ROUTE = CUSTOM_MODEL_ROUTE + "versions/{model_ver_id}/"
     CUSTOM_MODELS_VERSION_DEPENDENCY_BUILD_ROUTE = CUSTOM_MODELS_VERSION_ROUTE + "dependencyBuild/"
     CUSTOM_MODELS_VERSION_DEPENDENCY_BUILD_LOG_ROUTE = (
@@ -47,6 +51,7 @@ class DrClient:
     )
     CUSTOM_MODELS_TEST_ROUTE = "customModelTests/"
     CUSTOM_MODEL_DEPLOYMENTS_ROUTE = "customModelDeployments/"
+    CUSTOM_MODEL_DEPLOYMENT_LOG_ROUTE = CUSTOM_MODEL_DEPLOYMENTS_ROUTE + "{deployment_id}/logs/"
     CUSTOM_MODEL_TRAINING_DATA = CUSTOM_MODEL_ROUTE + "trainingData/"
     DATASETS_ROUTE = "datasets/"
     DATASET_UPLOAD_ROUTE = DATASETS_ROUTE + "fromFile/"
@@ -62,27 +67,9 @@ class DrClient:
     DEPLOYMENT_MODEL_CHALLENGER_ROUTE = DEPLOYMENT_ROUTE + "challengers/"
     DEPLOYMENT_ACTUALS_UPDATE_ROUTE = DEPLOYMENT_ROUTE + "actuals/fromDataset/"
     ENVIRONMENT_DROP_IN_ROUTE = "executionEnvironments/"
-
-    MODEL_TARGET_TYPE_MAP = {
-        ModelSchema.TARGET_TYPE_BINARY_KEY: "Binary",
-        ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY_KEY: "Binary",
-        ModelSchema.TARGET_TYPE_REGRESSION_KEY: "Regression",
-        ModelSchema.TARGET_TYPE_UNSTRUCTURED_REGRESSION_KEY: "Regression",
-        ModelSchema.TARGET_TYPE_MULTICLASS_KEY: "Multiclass",
-        ModelSchema.TARGET_TYPE_UNSTRUCTURED_MULTICLASS_KEY: "Multiclass",
-        ModelSchema.TARGET_TYPE_UNSTRUCTURED_OTHER_KEY: "Unstructured",
-    }
-
-    MODEL_SETTINGS_KEYS_MAP = {
-        ModelSchema.NAME_KEY: "name",
-        ModelSchema.DESCRIPTION_KEY: "description",
-        ModelSchema.LANGUAGE_KEY: "language",
-        ModelSchema.TARGET_NAME_KEY: "targetName",
-        ModelSchema.PREDICTION_THRESHOLD_KEY: "predictionThreshold",
-        ModelSchema.POSITIVE_CLASS_LABEL_KEY: "positiveClassLabel",
-        ModelSchema.NEGATIVE_CLASS_LABEL_KEY: "negativeClassLabel",
-        ModelSchema.CLASS_LABELS_KEY: "classLabels",
-    }
+    REGISTERED_MODELS_LIST_ROUTE = "registeredModels/"
+    REGISTERED_MODEL_ROUTE = "registeredModels/{registered_model_id}/"
+    REGISTERED_MODELS_VERSIONS_ROUTE = "registeredModels/{registered_model_id}/versions/"
 
     DEFAULT_MAX_WAIT_SEC = 600
 
@@ -187,6 +174,10 @@ class DrClient:
 
     def _paginated_fetch(self, route_url, **kwargs):
         def _fetch_single_page(url, raw):
+            if raw:
+                # 'params' are added to the url in the form of '&attr=value', so we want to skip
+                # it in case it is a 'raw' call that should not alter the url.
+                kwargs.pop("params", None)
             response = self._http_requester.get(url, raw, **kwargs)
             if response.status_code != 200:
                 raise DataRobotClientError(
@@ -214,14 +205,16 @@ class DrClient:
 
         return total_entities
 
-    def create_custom_model(self, model_info):
+    def create_custom_model(self, model_info, git_model_version):
         """
         Create a custom model in DataRobot.
 
         Parameters
         ----------
-        model_info : ModelInfo
+        model_info : model_info.ModelInfo
             A local model info as loaded from the local source tree.
+        git_model_version : common.GitModelVersion
+            A class that contains required information about the model's version in Git.
 
         Returns
         -------
@@ -229,7 +222,7 @@ class DrClient:
             A DataRobot custom model entity.
         """
 
-        payload = self._setup_payload_for_custom_model_creation(model_info)
+        payload = self._setup_payload_for_custom_model_creation(model_info, git_model_version)
         response = self._http_requester.post(self.CUSTOM_MODELS_ROUTE, json=payload)
         if response.status_code != 201:
             raise DataRobotClientError(
@@ -244,15 +237,21 @@ class DrClient:
         return custom_model
 
     @classmethod
-    def _setup_payload_for_custom_model_creation(cls, model_info):
+    def _setup_payload_for_custom_model_creation(cls, model_info, git_model_version):
         target_type = model_info.get_value(ModelSchema.TARGET_TYPE_KEY)
 
         payload = {
             "customModelType": constants.CUSTOM_MODEL_TYPE,
-            "targetType": cls.MODEL_TARGET_TYPE_MAP.get(target_type),
+            "targetType": DrApiTargetType.to_dr_attr(target_type),
             "targetName": model_info.get_settings_value(ModelSchema.TARGET_NAME_KEY),
             "isUnstructuredModelKind": model_info.is_unstructured,
             "userProvidedId": model_info.get_value(ModelSchema.MODEL_ID_KEY),
+            "gitModelVersion": {
+                "refName": git_model_version.ref_name,
+                "commitUrl": git_model_version.commit_url,
+                "mainBranchCommitSha": git_model_version.main_branch_commit_sha,
+                "pullRequestCommitSha": git_model_version.pull_request_commit_sha,
+            },
         }
 
         name = model_info.get_settings_value(ModelSchema.NAME_KEY)
@@ -286,6 +285,11 @@ class DrClient:
             )
         elif model_info.is_multiclass:
             payload["classLabels"] = model_info.get_settings_value(ModelSchema.CLASS_LABELS_KEY)
+
+        if model_info.is_there_a_change_in_training_or_holdout_data_at_version_level(
+            datarobot_latest_model_version=None
+        ):
+            payload["isTrainingDataForVersionsPermanentlyEnabled"] = True
 
         return payload
 
@@ -379,11 +383,9 @@ class DrClient:
     def create_custom_model_version(
         self,
         custom_model_id,
+        is_major_update,
         model_info,
-        ref_name,
-        commit_url,
-        main_branch_commit_sha,
-        pull_request_commit_sha=None,
+        git_model_version,
         changed_file_paths=None,
         file_ids_to_delete=None,
         from_latest=False,
@@ -395,16 +397,12 @@ class DrClient:
         ----------
         custom_model_id : str
             A DataRobot custom model ID.
-        model_info : ModelInfo
+        is_major_update : bool
+            Whether to create a major or minor version.
+        model_info : model_info.ModelInfo
             An information about the model in the local source tree.
-        ref_name : str
-            The branch or tag name that triggered the workflow run.
-        commit_url : str
-            A GitHub commit URL.
-        main_branch_commit_sha : str
-            A commit SHA from the main branch. For pull requests, it is the split point.
-        pull_request_commit_sha : str or None
-            The top commit sha of a feature branch in a pull request. Otherwise, None.
+        git_model_version : common.GitModelVersion
+            A class that contains required information about the model's version in Git.
         changed_file_paths : list[ModelFilePath] or None
             A list of changed files related to the last GitHub action.
         file_ids_to_delete : list[str] or None
@@ -425,11 +423,9 @@ class DrClient:
                 ModelSchema.VERSION_KEY, ModelSchema.MODEL_ENV_ID_KEY
             )
             payload, file_objs = self._setup_payload_for_custom_model_version_creation(
+                is_major_update,
                 model_info,
-                ref_name,
-                commit_url,
-                main_branch_commit_sha,
-                pull_request_commit_sha,
+                git_model_version,
                 changed_file_paths,
                 file_ids_to_delete=file_ids_to_delete,
                 base_env_id=base_env_id,
@@ -459,36 +455,159 @@ class DrClient:
         logger.info("Custom model version created successfully (id: %s)", model_version["id"])
         return model_version
 
+    def create_or_update_registered_model(self, custom_model_version_id, registered_model_name):
+        """
+        Creates or updates a registered model from custom model version.
+        If a registered model named registered_model_name exists, it is updated with a new
+        version if needed. If it does not exist, it is created.
+
+        Parameters
+        ----------
+        custom_model_version_id : str
+            Custom model version id to create registered model version from.
+        registered_model_name : str
+            Registered model name to create or update.
+
+        Returns
+        -------
+        str,
+            Registered model version id of existing or newly created version.
+        """
+        registered_model = self.get_registered_model_by_name(registered_model_name)
+        registered_model_id = registered_model["id"] if registered_model else None
+        if registered_model_id:
+            existing_registered_versions = self._get_registered_model_versions(registered_model_id)
+            existing_version_id = next(
+                (
+                    v["id"]
+                    for v in existing_registered_versions
+                    if v["modelId"] == custom_model_version_id
+                ),
+                None,
+            )
+            if existing_version_id:
+                logger.info(
+                    "Custom model version is already registered. Registered model name: %s, "
+                    "custom model version id: %s",
+                    registered_model_name,
+                    custom_model_version_id,
+                )
+                return existing_version_id
+            registered_model_name = None
+
+        model_package = self.create_model_package_from_custom_model_version(
+            custom_model_version_id,
+            registered_model_name,
+            registered_model_id,
+        )
+
+        return model_package["id"]
+
+    def update_registered_model(self, registered_model_name, description, is_global):
+        """
+        Updates registered model properties.
+
+        Parameters
+        ----------
+        registered_model_name : str
+            Name of registered model.
+        description : str
+            Description of registered model.
+        is_global : bool
+            True if model should be global, False if not.
+        """
+        registered_model = self.get_registered_model_by_name(registered_model_name)
+        if not registered_model:
+            raise DataRobotClientError(
+                f"Failed to find registered model by name: {registered_model_name}"
+            )
+
+        payload = {}
+
+        if description is not None and description != registered_model["description"]:
+            payload["description"] = description
+
+        if is_global is not None and is_global != registered_model.get("isGlobal", None):
+            payload["isGlobal"] = is_global
+
+        if not payload:
+            logger.info(
+                "Registered model '%s' settings are already up to date: %s",
+                registered_model_name,
+                is_global,
+            )
+            return
+
+        response = self._http_requester.patch(
+            self.REGISTERED_MODEL_ROUTE.format(registered_model_id=registered_model["id"]),
+            json=payload,
+        )
+        if response.status_code != 200:
+            raise DataRobotClientError(
+                "Failed to set registered global property "
+                f"Registered model name: {registered_model_name}, "
+                f"Response status: {response.status_code}, "
+                f"Response body: {response.text}",
+                code=response.status_code,
+            )
+
+        logger.info(
+            "Registered model '%s' global flag has been set to: %s",
+            registered_model_name,
+            is_global,
+        )
+
+    def get_registered_model_by_name(self, registered_model_name):
+        """
+        Retrieves a registered model by name.
+
+        Parameters
+        ----------
+        registered_model_name : str
+            The name of the registered model to get.
+
+        Returns
+        -------
+        dict or None,
+            Registered model if found, otherwise None.
+        """
+        items = self._paginated_fetch(
+            self.REGISTERED_MODELS_LIST_ROUTE,
+            params={"search": registered_model_name},
+        )
+        return next((item for item in items if item["name"] == registered_model_name), None)
+
+    def _get_registered_model_versions(self, registered_model_id):
+        return self._paginated_fetch(
+            self.REGISTERED_MODELS_VERSIONS_ROUTE.format(registered_model_id=registered_model_id),
+        )
+
     @classmethod
     def _setup_payload_for_custom_model_version_creation(
         cls,
+        is_major_update,
         model_info,
-        ref_name,
-        commit_url,
-        main_branch_commit_sha,
-        pull_request_commit_sha,
+        git_model_version,
         changed_file_paths,
         file_ids_to_delete=None,
         base_env_id=None,
     ):
         payload = [
+            ("isMajorUpdate", str(is_major_update)),
             (
                 "gitModelVersion",
                 json.dumps(
                     {
-                        "refName": ref_name,
-                        "commitUrl": commit_url,
-                        "mainBranchCommitSha": main_branch_commit_sha,
-                        "pullRequestCommitSha": pull_request_commit_sha,
+                        "refName": git_model_version.ref_name,
+                        "commitUrl": git_model_version.commit_url,
+                        "mainBranchCommitSha": git_model_version.main_branch_commit_sha,
+                        "pullRequestCommitSha": git_model_version.pull_request_commit_sha,
                     }
                 ),
             ),
         ]
 
         file_objs = cls._setup_model_version_files(changed_file_paths, file_ids_to_delete, payload)
-
-        is_major = bool(changed_file_paths or file_ids_to_delete or base_env_id)
-        payload.append(("isMajorUpdate", str(is_major)))
 
         if base_env_id:
             payload.append(("baseEnvironmentId", base_env_id))
@@ -500,6 +619,12 @@ class DrClient:
         replicas = model_info.get_value(ModelSchema.VERSION_KEY, ModelSchema.REPLICAS_KEY)
         if replicas:
             payload.append(("replicas", str(replicas)))
+
+        egress_network_policy = model_info.get_value(
+            ModelSchema.VERSION_KEY, ModelSchema.EGRESS_NETWORK_POLICY_KEY
+        )
+        if egress_network_policy:
+            payload.append(("networkEgressPolicy", str(egress_network_policy)))
 
         return payload, file_objs
 
@@ -561,6 +686,102 @@ class DrClient:
                 "Failed to update custom model version main branch commit SHA. "
                 f"Response status: {response.status_code} "
                 f"Response body: {response.text}",
+                code=response.status_code,
+            )
+        return response.json()
+
+    def create_version_from_latest_with_training_and_holdout_data(
+        self, model_info, datarobot_custom_model, git_model_version
+    ):
+        """
+        Creates a new custom model version from latest with new training and/or holdout data.
+
+        Parameters
+        ----------
+        model_info : model_info.ModelInfo
+            An information about the model in the local source tree.
+        datarobot_custom_model : dict
+            A DataRobot custom model entity.
+        git_model_version : common.GitModelVersion
+            A class that contains required information about the model's version in Git.
+
+        Returns
+        -------
+        dict
+            Custom inference model version.
+        """
+
+        if not datarobot_custom_model.get("isTrainingDataForVersionsPermanentlyEnabled"):
+            self._permanently_enable_training_data_for_versions_in_model(
+                model_info, datarobot_custom_model
+            )
+
+        holdout_data = (
+            {
+                "datasetId": model_info.get_value(
+                    ModelSchema.VERSION_KEY, ModelSchema.HOLDOUT_DATASET_ID_KEY
+                )
+            }
+            if model_info.is_unstructured
+            else {
+                "partitionColumn": model_info.get_value(
+                    ModelSchema.VERSION_KEY, ModelSchema.PARTITIONING_COLUMN_KEY
+                )
+            }
+        )
+
+        payload = {
+            "trainingData": {
+                "datasetId": model_info.get_value(
+                    ModelSchema.VERSION_KEY, ModelSchema.TRAINING_DATASET_ID_KEY
+                )
+            },
+            "holdoutData": holdout_data,
+            "gitModelVersion": {
+                "refName": git_model_version.ref_name,
+                "commitUrl": git_model_version.commit_url,
+                "mainBranchCommitSha": git_model_version.main_branch_commit_sha,
+                "pullRequestCommitSha": git_model_version.pull_request_commit_sha,
+            },
+        }
+
+        url = DrClient.CUSTOM_MODELS_VERSIONS_CREATE_WITH_TRAINING_DATA_ROUTE.format(
+            model_id=datarobot_custom_model["id"]
+        )
+        response = self._http_requester.patch(url, json=payload)
+        if response.status_code != 202:
+            raise DataRobotClientError(
+                "Failed to assign training/holdout data at custom model version level. "
+                f"Response status: {response.status_code} "
+                f"Response body: {response.text}",
+                code=response.status_code,
+            )
+        location = self._wait_for_async_resolution(response.headers["Location"])
+        response = self._http_requester.get(location, raw=True)
+        return response.json()
+
+    def _permanently_enable_training_data_for_versions_in_model(
+        self, model_info, datarobot_custom_model
+    ):
+        logger.info(
+            "Permanently enable training data for version in model '%s'.",
+            model_info.user_provided_id,
+        )
+        payload = {"isTrainingDataForVersionsPermanentlyEnabled": True}
+        err_msg = "Failed to permanently enable training data for version"
+        self._update_model(model_info, datarobot_custom_model, payload, err_msg)
+
+    def _update_model(self, model_info, datarobot_custom_model, payload, err_msg=None):
+        err_msg = err_msg or "Failed to update custom model"
+        url = self.CUSTOM_MODEL_ROUTE.format(model_id=datarobot_custom_model["id"])
+        response = self._http_requester.patch(url, json=payload)
+        if response.status_code != 200:
+            raise DataRobotClientError(
+                f"{err_msg}. "
+                f"User provided ID: {model_info.user_provided_id}. "
+                f"DataRobot model ID: {datarobot_custom_model['id']}. "
+                f"Response status: {response.status_code}. "
+                f"Response body: {response.text}.",
                 code=response.status_code,
             )
         return response.json()
@@ -727,7 +948,7 @@ class DrClient:
             A DataRobot custom model ID.
         model_version_id : str
             A DataRobot custom model version ID.
-        model_info : ModelInfo
+        model_info : model_info.ModelInfo
             A class that contains full information about a single model from the local source tree.
         """
 
@@ -815,11 +1036,11 @@ class DrClient:
             "longRunningService": "fail",
             "errorCheck": "fail",
         }
-        for local_check_name, dr_check_name in DrApiAttrs.DR_TEST_CHECK_MAP.items():
+        for local_check_name, dr_check_name in DrApiCustomModelChecks.MAPPING.items():
             check_config_value = "skip"
             if loaded_checks:
                 check_info = loaded_checks.get(local_check_name)
-                if check_info[ModelSchema.CHECK_ENABLED_KEY]:
+                if check_info and check_info[ModelSchema.CHECK_ENABLED_KEY]:
                     check_config_value = (
                         "fail" if check_info[ModelSchema.BLOCK_DEPLOYMENT_IF_FAILS_KEY] else "warn"
                     )
@@ -843,7 +1064,7 @@ class DrClient:
                     check_params.update(cls._get_stability_check_params(info))
 
                 if check_params:
-                    dr_check_name = DrApiAttrs.to_dr_test_check(check)
+                    dr_check_name = DrApiCustomModelChecks.to_dr_attr(check)
                     parameters[dr_check_name] = check_params
         return parameters
 
@@ -888,9 +1109,16 @@ class DrClient:
 
         return check_params
 
-    def fetch_custom_model_tests(self, custom_model_id):
+    def fetch_custom_model_tests(self, custom_model_id, **kwargs):
         """
         Retrieve custom model tests from DataRobot.
+
+        Parameters
+        ----------
+        custom_model_id : str
+            A DataRobot custom inference model ID.
+        kwargs : dict
+            A key-value pairs to be submitted as additional attributes when querying DataRobot.
 
         Returns
         -------
@@ -900,6 +1128,8 @@ class DrClient:
 
         logger.debug("Fetching custom model tests for DataRobot model ID %s", custom_model_id)
         params = {"customModelId": custom_model_id}
+        if kwargs:
+            params.update(kwargs)
         return self._paginated_fetch(self.CUSTOM_MODELS_TEST_ROUTE, params=params)
 
     def upload_dataset(self, dataset_filepath):
@@ -1046,15 +1276,47 @@ class DrClient:
             A DataRobot deployment.
         """
 
-        model_package = self._create_model_package_from_custom_model_version(
+        model_package = self.create_model_package_from_custom_model_version(
             custom_model_version["id"]
         )
         deployment = self._create_deployment_from_model_package(model_package, deployment_info)
         deployment, _ = self.update_deployment_settings(deployment, deployment_info)
         return deployment
 
-    def _create_model_package_from_custom_model_version(self, custom_model_version_id):
+    def create_model_package_from_custom_model_version(
+        self,
+        custom_model_version_id,
+        registered_model_name=None,
+        registered_model_id=None,
+    ):
+        """
+        Creates a model package in the model's registry from a custom model version.
+
+        Parameters
+        ----------
+        custom_model_version_id : str
+            A custom model version ID
+        registered_model_name : str
+            Registered model name. This will add the model package as a registered model version
+            of a new registered model by this name.
+            If None, will be left out of request.
+        registered_model_id : str
+            Registered model id. This will add the model package as a registered model version
+            of an existing registered model by this id.
+            IF None, will be left out of request.
+
+        Returns
+        -------
+        dict :
+            A DataRobot model package entity.
+        """
+
         payload = {"customModelVersionId": custom_model_version_id}
+        if registered_model_name:
+            payload["registeredModelName"] = registered_model_name
+        if registered_model_id:
+            payload["registeredModelId"] = registered_model_id
+
         response = self._http_requester.post(self.MODEL_PACKAGES_CREATE_ROUTE, json=payload)
         if response.status_code != 201:
             raise DataRobotClientError(
@@ -1087,18 +1349,66 @@ class DrClient:
         response = self._http_requester.post(self.DEPLOYMENTS_CREATE_ROUTE, json=payload)
         if response.status_code != 202:
             raise DataRobotClientError(
-                "Failed creating a deployment from model package."
+                "Failed creating a deployment from a model package."
                 f"User provided deployment id: {deployment_info.user_provided_id}, "
                 f"Model package id: {model_package['id']}, "
                 f"Response status: {response.status_code}, "
                 f"Response body: {response.text}",
                 code=response.status_code,
             )
-        location = self._wait_for_async_resolution(
-            response.headers["Location"], max_wait=self.DEPLOYMENT_CREATE_MAX_WAIT_SEC
+        deployment_id = response.json()["id"]
+        try:
+            location = self._wait_for_async_resolution(
+                response.headers["Location"], max_wait=self.DEPLOYMENT_CREATE_MAX_WAIT_SEC
+            )
+        except HttpRequesterException as ex:
+            self._report_persistent_deployment_logs_if_any(deployment_id)
+            raise DataRobotClientError(
+                "A certain background job was failing during a deployment's creation. "
+                f"DataRobot deployment id: {deployment_id}, "
+                f"User provided deployment id: {deployment_info.user_provided_id}, "
+                f"Model package id: {model_package['id']}, "
+                f"Exception: {str(ex)}."
+            ) from ex
+        else:
+            logging_level, msg = self._report_runtime_deployment_logs_if_any(deployment_id)
+            if logging_level in (logging.WARNING, logging.ERROR):
+                raise DataRobotClientError(
+                    "A deployment reported a warning or an error. Stopping. "
+                    f"DataRobot deployment id: {deployment_id}, "
+                    f"User provided deployment id: {deployment_info.user_provided_id}, "
+                    f"Model package id: {model_package['id']}, "
+                    f"Message: {msg}"
+                )
+            response = self._http_requester.get(location, raw=True)
+            deployment = response.json()
+            return deployment
+
+    def _report_persistent_deployment_logs_if_any(self, deployment_id):
+        deployment_log_url = self.CUSTOM_MODEL_DEPLOYMENT_LOG_ROUTE.format(
+            deployment_id=deployment_id
         )
-        response = self._http_requester.get(location, raw=True)
-        return response.json()
+        response = self._http_requester.get(deployment_log_url)
+        if response.status_code == 200 and response.text:
+            logger.error(response.text)
+
+    def _report_runtime_deployment_logs_if_any(self, deployment_id):
+        deployment_log_url = self.CUSTOM_MODEL_DEPLOYMENT_LOG_ROUTE.format(
+            deployment_id=deployment_id
+        )
+        response = self._http_requester.post(deployment_log_url)
+        if response.status_code == 202:
+            location = self._wait_for_async_resolution(response.headers["Location"])
+            response = self._http_requester.get(location, raw=True)
+            if response.status_code == 200 and response.text:
+                if "WARNING" in response.text:
+                    logger.warning(response.text)
+                    return logging.WARNING, response.text
+                if "ERROR" in response.text:
+                    logger.error(response.text)
+                    return logging.ERROR, response.text
+                return logging.INFO, logger.info(response.text)
+        return None, None
 
     def _get_prediction_environment_id(self, model_package, deployment_info):
         prediction_environment_name = deployment_info.get_value(
@@ -1226,21 +1536,26 @@ class DrClient:
             if association_payload:
                 payload["associationId"] = association_payload
 
-        desired_target_drift = deployment_info.get_settings_value(
+        desired_target_drift_enabled = deployment_info.get_settings_value(
             DeploymentSchema.ENABLE_TARGET_DRIFT_KEY
         )
-        if desired_target_drift is not None:
-            actual_targe_drift = actual_settings["targetDrift"] if actual_settings else None
-            if actual_targe_drift != desired_target_drift:
-                payload["targetDrift"] = {"enabled": desired_target_drift}
+        if desired_target_drift_enabled is not None:
+            actual_target_drift_enabled = bool(
+                actual_settings and actual_settings.get("targetDrift", {}).get("enabled")
+            )
+            if desired_target_drift_enabled != actual_target_drift_enabled:
+                payload["targetDrift"] = {"enabled": desired_target_drift_enabled}
 
-        desired_feature_drift = deployment_info.get_settings_value(
+        desired_feature_drift_enabled = deployment_info.get_settings_value(
             DeploymentSchema.ENABLE_FEATURE_DRIFT_KEY
         )
-        if desired_feature_drift is not None:
-            actual_feature_drift = actual_settings["featureDrift"] if actual_settings else None
-            if actual_feature_drift != desired_feature_drift:
-                payload["featureDrift"] = {"enabled": desired_feature_drift}
+        if desired_feature_drift_enabled is not None:
+            actual_feature_drift_enabled = bool(
+                actual_settings and actual_settings.get("featureDrift", {}).get("enabled")
+            )
+
+            if desired_feature_drift_enabled != actual_feature_drift_enabled:
+                payload["featureDrift"] = {"enabled": desired_feature_drift_enabled}
 
         desired_segmented_analysis = deployment_info.get_settings_value(
             DeploymentSchema.SEGMENT_ANALYSIS_KEY
@@ -1335,12 +1650,14 @@ class DrClient:
             DeploymentSchema.SEGMENT_ANALYSIS_KEY,
             DeploymentSchema.ENABLE_SEGMENT_ANALYSIS_KEY,
         )
-        if desired_enabled is not None:
-            actual_enabled = (
-                actual_settings["segmentAnalysis"]["enabled"] if actual_settings else None
-            )
-            if desired_enabled != actual_enabled:
-                segmented_analysis_payload = {"enabled": desired_enabled}
+        desired_enabled = bool(desired_enabled)
+        actual_enabled = (
+            actual_settings.get("segmentAnalysis", {}).get("enabled", False)
+            if actual_settings
+            else False
+        )
+        if desired_enabled != actual_enabled:
+            segmented_analysis_payload["enabled"] = desired_enabled
 
         desired_attributes = deployment_info.get_settings_value(
             DeploymentSchema.SEGMENT_ANALYSIS_KEY,
@@ -1348,10 +1665,16 @@ class DrClient:
         )
         if desired_attributes is not None:
             actual_attributes = (
-                actual_settings["segmentAnalysis"]["attributes"] if actual_settings else None
+                actual_settings.get("segmentAnalysis", {}).get("attributes")
+                if actual_settings
+                else None
             )
             if desired_attributes != actual_attributes:
-                segmented_analysis_payload["attributes"] = desired_attributes
+                # The `enabled` attribute is mandatory, so make sure it is set.
+                segmented_analysis_payload = {
+                    "enabled": desired_enabled,
+                    "attributes": desired_attributes,
+                }
 
         return segmented_analysis_payload
 
@@ -1490,31 +1813,33 @@ class DrClient:
 
         return self._paginated_fetch(url)
 
-    def replace_model_deployment(self, custom_model_version, datarobot_deployment):
+    def replace_model_deployment(self, model_info, custom_model_version, datarobot_deployment):
         """
-        Replace a custom model version in a given deployment in DataRobot.
+         Replace a custom model version in a given deployment in DataRobot.
 
-        Parameters
-        ----------
-        custom_model_version : dict
-            A DataRobot custom model version.
-        datarobot_deployment : dict
-            A DataRobot deployment.
+         Parameters
+         ----------
+        model_info : model_info.ModelInfo
+             The associated model metadata, which is read from the local source tree.
+         custom_model_version : dict
+             A DataRobot custom model version.
+         datarobot_deployment : dict
+             A DataRobot deployment.
 
-        Returns
-        -------
-        dict,
-            A DataRobot deployment, in which the model was replaced.
+         Returns
+         -------
+         dict,
+             A DataRobot deployment, in which the model was replaced.
         """
 
-        model_package = self._create_model_package_from_custom_model_version(
+        model_package = self.create_model_package_from_custom_model_version(
             custom_model_version["id"]
         )
         self._validate_model_compatibility(
             model_package["id"], datarobot_deployment.deployment["id"]
         )
         return self._replace_deployment_model(
-            model_package["id"], datarobot_deployment.deployment["id"]
+            model_info, model_package["id"], datarobot_deployment.deployment["id"]
         )
 
     def _validate_model_compatibility(self, model_package_id, deployment_id):
@@ -1540,8 +1865,8 @@ class DrClient:
         else:
             logger.info(validation_message)
 
-    def _replace_deployment_model(self, model_package_id, deployment_id):
-        payload = {"modelPackageId": model_package_id, "reason": "DATA_DRIFT"}
+    def _replace_deployment_model(self, model_info, model_package_id, deployment_id):
+        payload = self._setup_model_replacement_payload(model_info, model_package_id)
         url = self.DEPLOYMENT_MODEL_ROUTE.format(deployment_id=deployment_id)
         response = self._http_requester.patch(url, json=payload)
         if response.status_code != 202:
@@ -1555,6 +1880,13 @@ class DrClient:
         response = self._http_requester.get(location, raw=True)
         deployment = response.json()
         return deployment
+
+    @staticmethod
+    def _setup_model_replacement_payload(model_info, model_package_id):
+        replacement_reason = model_info.get_value(
+            ModelSchema.VERSION_KEY, ModelSchema.MODEL_REPLACEMENT_REASON_KEY
+        )
+        return {"modelPackageId": model_package_id, "reason": replacement_reason}
 
     def create_challenger(self, custom_model_version, datarobot_deployment, deployment_info):
         """
@@ -1575,7 +1907,7 @@ class DrClient:
             A DataRobot challenger.
         """
 
-        model_package = self._create_model_package_from_custom_model_version(
+        model_package = self.create_model_package_from_custom_model_version(
             custom_model_version["id"]
         )
         deployment_id = datarobot_deployment.deployment["id"]
@@ -1641,7 +1973,7 @@ class DrClient:
         ----------
         datarobot_custom_model : dict
             A DataRobot custom model.
-        model_info : ModelInfo
+        model_info : model_info.ModelInfo
             An information about a model, which is read from the local source tree.
 
         Returns
@@ -1650,34 +1982,61 @@ class DrClient:
             A custom model entity from DataRobot if an update took place or None otherwise.
         """
 
-        ext_stats_payload = {}
-        remote_settings = datarobot_custom_model.get("externalMlopsStatsConfig", {}) or {}
-
-        DatasetParam = namedtuple("DatasetParam", ["local", "remote"])
-        dataset_params = [
-            DatasetParam(ModelSchema.TRAINING_DATASET_ID_KEY, "trainingDatasetId"),
-            DatasetParam(ModelSchema.HOLDOUT_DATASET_ID_KEY, "holdoutDatasetId"),
-        ]
-        for dataset_param in dataset_params:
-            local_value = model_info.get_settings_value(dataset_param.local)
-            if local_value and local_value != remote_settings.get(dataset_param.remote):
-                ext_stats_payload[dataset_param.remote] = local_value
-
+        ext_stats_payload = self.get_training_holdout_patch_payload_at_model_level(
+            model_info, datarobot_custom_model
+        )
         if ext_stats_payload:
-            payload = {"externalMlopsStatsConfig": ext_stats_payload}
-            url = self.CUSTOM_MODEL_ROUTE.format(model_id=datarobot_custom_model["id"])
-            response = self._http_requester.patch(url, json=payload)
-            if response.status_code != 200:
-                raise DataRobotClientError(
-                    "Failed to update training / holdout datasets for unstructured model. "
-                    f"User provided ID: {model_info.user_provided_id}, "
-                    f"DataRobot model ID: {datarobot_custom_model['id']}, "
-                    f"Response status: {response.status_code}, "
-                    f"Response body: {response.text}",
-                    code=response.status_code,
-                )
-            return response.json()
+            err_msg = "Failed to update training / holdout datasets for unstructured model"
+            return self._update_model(
+                model_info, datarobot_custom_model, ext_stats_payload, err_msg
+            )
         return None
+
+    @staticmethod
+    def get_training_holdout_patch_payload_at_model_level(model_info, datarobot_model):
+        """
+        Returns a payload for the training/holdout attributes that need to be updated in DataRobot
+        after a comparison to the local corresponding values. For unstructured models the payload
+        contains an `externalMlopsStatsConfig` attribute, which is a map of the related attributes.
+        For structured models, the payload contains the related attributes (which are different
+        from the response) for the PATCH operation.
+
+        Parameters
+        ----------
+        model_info : model_info.ModelInfo
+            An information about the model, which is read from the local source tree.
+        datarobot_model : dict
+            A dict that contains all the attributes of a model in DataRobot.
+
+        Returns
+        -------
+        dict :
+            The payload of a PATCH of the training/holdout DataRobot model.
+        """
+
+        if model_info.is_unstructured:
+            training_holdout_mapping = DrApiModelSettings.UNSTRUCTURED_TRAINING_HOLDOUT_MAPPING
+            remote_settings = datarobot_model.get("externalMlopsStatsConfig") or {}
+        else:
+            training_holdout_mapping = (
+                DrApiModelSettings.STRUCTURED_TRAINING_HOLDOUT_RESPONSE_MAPPING
+            )
+            remote_settings = datarobot_model
+
+        payload = {}
+        for local_key, remote_key in training_holdout_mapping.items():
+            local_value = model_info.get_settings_value(local_key)
+            remote_value = remote_settings.get(remote_key)
+            if local_value != remote_value:
+                if model_info.is_unstructured:
+                    if "externalMlopsStatsConfig" not in payload:
+                        payload["externalMlopsStatsConfig"] = {}
+                    payload["externalMlopsStatsConfig"][remote_key] = local_value
+                else:
+                    patch_key_mapping = DrApiModelSettings.STRUCTURED_TRAINING_HOLDOUT_PATCH_MAPPING
+                    remote_patch_key = patch_key_mapping[local_key]
+                    payload[remote_patch_key] = local_value
+        return payload
 
     def update_training_dataset_for_structured_models(self, datarobot_custom_model, model_info):
         """
@@ -1688,7 +2047,7 @@ class DrClient:
         ----------
         datarobot_custom_model : dict
             A DataRobot custom model.
-        model_info : ModelInfo
+        model_info : model_info.ModelInfo
             An information about the model, which is read from the local source tree.
 
         Returns
@@ -1697,40 +2056,50 @@ class DrClient:
             The updated custom model from DataRobot if an update took place, or None otherwise.
         """
 
-        training_dataset_payload = {}
-
-        DatasetParam = namedtuple("DatasetParam", ["local", "remote", "patch_remote"])
-        dataset_params = [
-            DatasetParam(ModelSchema.TRAINING_DATASET_ID_KEY, "trainingDatasetId", "datasetId"),
-            DatasetParam(
-                ModelSchema.PARTITIONING_COLUMN_KEY,
-                "trainingDataPartitionColumn",
-                "partitionColumn",
-            ),
-        ]
-        for dataset_param in dataset_params:
-            local_value = model_info.get_settings_value(dataset_param.local)
-            if local_value and local_value != datarobot_custom_model.get(dataset_param.remote):
-                training_dataset_payload[dataset_param.patch_remote] = local_value
-
+        training_dataset_payload = self.get_training_holdout_patch_payload_at_model_level(
+            model_info, datarobot_custom_model
+        )
         if training_dataset_payload:
             url = self.CUSTOM_MODEL_TRAINING_DATA.format(model_id=datarobot_custom_model["id"])
             response = self._http_requester.patch(url, json=training_dataset_payload)
             if response.status_code != 202:
-                raise DataRobotClientError(
-                    "Failed to update training dataset for structured model. "
-                    f"User provided ID: {model_info.user_provided_id}. "
-                    f"DataRobot model ID: {datarobot_custom_model['id']}. "
-                    f"Response status: {response.status_code}. "
-                    f"Response body: {response.text}.",
-                    code=response.status_code,
+                msg = "Failed to update training dataset for structured model"
+                self._raise_training_assignment_exception(
+                    msg, model_info, datarobot_custom_model, response
                 )
             location = self._wait_for_async_resolution(response.headers["Location"])
             response = self._http_requester.get(location, raw=True)
             return response.json()
         return None
 
-    def update_model_settings(self, datarobot_custom_model, model_info):
+    @staticmethod
+    def _raise_training_assignment_exception(msg, model_info, datarobot_custom_model, response):
+        message = (
+            f"{msg}. "
+            f"User provided ID: {model_info.user_provided_id}. "
+            f"DataRobot model ID: {datarobot_custom_model['id']}. "
+            f"Response status: {response.status_code}. "
+            f"Response body: {response.text}."
+        )
+        if (
+            response.status_code == 422
+            and "Training data assignment at the model level has been permanently disabled"
+            in response.text
+        ):
+            message += (
+                "\nHint: please move the training/holdout attributes in your model's YAML "
+                "definition, from the 'settings' section to the 'version' section."
+            )
+
+        raise DataRobotClientError(message, code=response.status_code)
+
+    def update_model_settings(
+        self,
+        datarobot_custom_model,
+        model_info,
+        git_model_version,
+        force_git_model_version_update=False,
+    ):
         """
         Update custom inference model settings in DataRobot.
 
@@ -1738,8 +2107,13 @@ class DrClient:
         ----------
         datarobot_custom_model : dict
             A DataRobot custom model.
-        model_info : ModelInfo
+        model_info : model_info.ModelInfo
             An information about the model, which is read from the local source tree.
+        git_model_version : common.GitModelVersion
+            A class that contains required Git information related to the last changes.
+        force_git_model_version_update : bool
+            Optional. Whether to update git model version even if there were no direct change
+            to model's settings.
 
         Returns
         -------
@@ -1747,27 +2121,46 @@ class DrClient:
             The updated custom model from DatRobot if an update took place, or None otherwise.
         """
 
-        payload = {}
-
-        for local_key, remote_key in self.MODEL_SETTINGS_KEYS_MAP.items():
-            local_value = model_info.get_settings_value(local_key)
-            if local_value and local_value != datarobot_custom_model[remote_key]:
-                payload[remote_key] = local_value
-
-        if payload:
-            url = self.CUSTOM_MODEL_ROUTE.format(model_id=datarobot_custom_model["id"])
-            response = self._http_requester.patch(url, json=payload)
-            if response.status_code != 200:
-                raise DataRobotClientError(
-                    "Failed to update custom model settings. "
-                    f"User provided ID: {model_info.user_provided_id}. "
-                    f"DataRobot model ID: {datarobot_custom_model['id']}. "
-                    f"Response status: {response.status_code}. "
-                    f"Response body: {response.text}.",
-                    code=response.status_code,
-                )
-            return response.json()
+        payload = self.get_settings_patch_payload(model_info, datarobot_custom_model)
+        if payload or force_git_model_version_update:
+            payload = payload or {}
+            payload["gitModelVersion"] = {
+                "refName": git_model_version.ref_name,
+                "commitUrl": git_model_version.commit_url,
+                "mainBranchCommitSha": git_model_version.main_branch_commit_sha,
+                "pullRequestCommitSha": git_model_version.pull_request_commit_sha,
+            }
+            err_msg = "Failed to update custom model settings"
+            return self._update_model(model_info, datarobot_custom_model, payload, err_msg)
         return None
+
+    @staticmethod
+    def get_settings_patch_payload(model_info, datarobot_model):
+        """
+        Returns a payload for the settings attributes that need to be updated in DataRobot,
+        after a comparison to the local corresponding values.
+
+        Parameters
+        ----------
+        model_info : model_info.ModelInfo
+            An information about the model, which is read from the local source tree.
+        datarobot_model : dict
+            A dict that contains all the attributes of a model in DataRobot.
+
+        Returns
+        -------
+        dict :
+            The payload for a PATCH of the DataRobot settings.
+        """
+
+        payload = {}
+        for local_key, remote_key in DrApiModelSettings.MAPPING.items():
+            if remote_key == DrApiModelSettings.ReservedValues.UNSET:
+                continue
+            local_value = model_info.get_settings_value(local_key)
+            if local_value and local_value != datarobot_model.get(remote_key):
+                payload[remote_key] = local_value
+        return payload
 
     def fetch_environment_drop_in(self, search_for=None):
         """

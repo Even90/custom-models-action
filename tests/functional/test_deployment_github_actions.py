@@ -11,6 +11,7 @@ DataRobot application. If DataRobot is not accessible, the functional tests are 
 """
 
 import contextlib
+import logging
 import os
 import re
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 import yaml
 
 from common import constants
+from common.exceptions import AssociatedModelNotFound
 from common.exceptions import DataRobotClientError
 from common.exceptions import IllegalModelDeletion
 from common.namepsace import Namespace
@@ -30,35 +32,15 @@ from tests.conftest import unique_str
 from tests.functional.conftest import cleanup_models
 from tests.functional.conftest import increase_model_memory_by_1mb
 from tests.functional.conftest import printout
+from tests.functional.conftest import replace_and_store_schema
 from tests.functional.conftest import run_github_action
+from tests.functional.conftest import save_new_metadata_and_commit
 from tests.functional.conftest import temporarily_replace_schema
 from tests.functional.conftest import (
     temporarily_upload_training_dataset_for_structured_model,
 )
 from tests.functional.conftest import upload_and_update_dataset
 from tests.functional.conftest import webserver_accessible
-
-
-# pylint: disable=unused-argument
-@pytest.fixture(name="deployment_metadata_yaml_file")
-def fixture_deployment_metadata_yaml_file(
-    workspace_path, git_repo, build_repo_for_testing, model_metadata
-):
-    """A fixture to return a unique deployment from the temporary created local source tree."""
-
-    deployment_yaml_file = next(workspace_path.rglob("**/deployment.yaml"))
-    with open(deployment_yaml_file, encoding="utf-8") as fd:
-        yaml_content = yaml.safe_load(fd)
-        yaml_content[DeploymentSchema.DEPLOYMENT_ID_KEY] = f"deployment-id-{unique_str()}"
-        yaml_content[DeploymentSchema.MODEL_ID_KEY] = model_metadata[ModelSchema.MODEL_ID_KEY]
-
-    with open(deployment_yaml_file, "w", encoding="utf-8") as fd:
-        yaml.safe_dump(yaml_content, fd)
-
-    git_repo.git.add(deployment_yaml_file)
-    git_repo.git.commit("--amend", "--no-edit")
-
-    return deployment_yaml_file
 
 
 @pytest.fixture(name="deployment_metadata")
@@ -68,6 +50,16 @@ def fixture_deployment_metadata(deployment_metadata_yaml_file):
     with open(deployment_metadata_yaml_file, encoding="utf-8") as fd:
         raw_metadata = yaml.safe_load(fd)
         return DeploymentSchema.validate_and_transform_single(raw_metadata)
+
+
+@pytest.fixture(name="skip_association")
+def fixture_skip_association(git_repo, deployment_metadata_yaml_file, deployment_metadata):
+    """A fixture to remove the association section from a given deployment metadata."""
+
+    deployment_metadata[DeploymentSchema.SETTINGS_SECTION_KEY].pop(DeploymentSchema.ASSOCIATION_KEY)
+    save_new_metadata_and_commit(
+        deployment_metadata, deployment_metadata_yaml_file, git_repo, "Skip association"
+    )
 
 
 @pytest.fixture(name="cleanup")
@@ -93,38 +85,36 @@ def cleanup_deployment(dr_client, deployment_metadata):
 
 
 @pytest.mark.skipif(not webserver_accessible(), reason="DataRobot webserver is not accessible.")
-@pytest.mark.usefixtures("build_repo_for_testing", "github_output")
+@pytest.mark.usefixtures("cleanup", "build_repo_for_testing", "github_output")
 class TestDeploymentGitHubActions:
     """Contains cases to test the deployment GitHub action."""
 
     @contextlib.contextmanager
     def _upload_actuals_dataset(
-        self, event_name, dr_client, deployment_metadata, deployment_metadata_yaml_file
+        self, dr_client, deployment_metadata, deployment_metadata_yaml_file
     ):
-        if event_name == "push":
-            association_id_column = DeploymentSchema.get_value(
-                deployment_metadata,
+        association_id_column = DeploymentSchema.get_value(
+            deployment_metadata,
+            DeploymentSchema.SETTINGS_SECTION_KEY,
+            DeploymentSchema.ASSOCIATION_KEY,
+            DeploymentSchema.ASSOCIATION_ASSOCIATION_ID_COLUMN_KEY,
+        )
+        if association_id_column:
+            actuals_filepath = (
+                Path(__file__).parent
+                / ".."
+                / "datasets"
+                / "juniors_3_year_stats_regression_actuals.csv"
+            )
+            with upload_and_update_dataset(
+                dr_client,
+                actuals_filepath,
+                deployment_metadata_yaml_file,
                 DeploymentSchema.SETTINGS_SECTION_KEY,
                 DeploymentSchema.ASSOCIATION_KEY,
-                DeploymentSchema.ASSOCIATION_ASSOCIATION_ID_COLUMN_KEY,
-            )
-            if association_id_column:
-                actuals_filepath = (
-                    Path(__file__).parent
-                    / ".."
-                    / "datasets"
-                    / "juniors_3_year_stats_regression_actuals.csv"
-                )
-                with upload_and_update_dataset(
-                    dr_client,
-                    actuals_filepath,
-                    deployment_metadata_yaml_file,
-                    DeploymentSchema.ASSOCIATION_KEY,
-                    DeploymentSchema.ASSOCIATION_ACTUALS_DATASET_ID_KEY,
-                ) as dataset_id:
-                    yield dataset_id
-        else:
-            yield None
+                DeploymentSchema.ASSOCIATION_ACTUALS_DATASET_ID_KEY,
+            ) as dataset_id:
+                yield dataset_id
 
     @staticmethod
     def _commit_changes_by_event(commit_message, event_name, git_repo):
@@ -161,7 +151,7 @@ class TestDeploymentGitHubActions:
             raise Exception("Unsupported git event!")
 
     @pytest.mark.parametrize("event_name", ["push", "pull_request"])
-    @pytest.mark.usefixtures("cleanup", "skip_model_testing")
+    @pytest.mark.usefixtures("skip_model_testing")
     def test_e2e_deployment_create(
         self,
         dr_client,
@@ -177,7 +167,7 @@ class TestDeploymentGitHubActions:
         # Upload actuals dataset and set the deployment metadata with the dataset ID
         printout("Upload actuals dataset")
         with self._upload_actuals_dataset(
-            event_name, dr_client, deployment_metadata, deployment_metadata_yaml_file
+            dr_client, deployment_metadata, deployment_metadata_yaml_file
         ):
             self._commit_changes_by_event("Update actuals dataset", event_name, git_repo)
 
@@ -198,10 +188,67 @@ class TestDeploymentGitHubActions:
 
         printout("Done")
 
+    @pytest.mark.usefixtures("skip_model_testing")
+    def test_e2e_existing_deployment_with_deleted_model_metadata(
+        self,
+        dr_client,
+        workspace_path,
+        git_repo,
+        deployment_metadata,
+        deployment_metadata_yaml_file,
+        main_branch_name,
+        feature_branch_name,
+        merge_branch_name,
+        model_metadata_yaml_file,
+    ):
+        """
+        An end-to-end case to test a scenario in which the user deletes a model metadata
+        definition in a PR while the model is deployed in DataRobot.
+        """
+
+        # Upload actuals dataset and set the deployment metadata with the dataset ID
+        printout("Upload actuals dataset")
+        with self._upload_actuals_dataset(
+            dr_client, deployment_metadata, deployment_metadata_yaml_file
+        ):
+            self._commit_changes_by_event("Update actuals dataset", "push", git_repo)
+
+            printout("Run the GitHub action to create a model and deployment")
+            run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=True)
+
+            # Validate that the deployment was created in DataRobot
+            local_user_provided_id = deployment_metadata[DeploymentSchema.DEPLOYMENT_ID_KEY]
+            assert dr_client.fetch_deployment_by_git_id(local_user_provided_id) is not None
+
+            # Create a feature branch and checkout
+            printout("Create a feature branch ...")
+            feature_branch = git_repo.create_head(feature_branch_name)
+            feature_branch.checkout()
+
+            # Delete the local model definition (metadata) YAML file
+            os.remove(model_metadata_yaml_file)
+            git_repo.git.add(model_metadata_yaml_file)
+            git_repo.git.commit("-m", "Removed model's definition")
+
+            # Create a merge branch
+            merge_branch = git_repo.create_head(merge_branch_name, main_branch_name)
+            git_repo.head.reference = merge_branch
+            git_repo.head.reset(index=True, working_tree=True)
+            git_repo.git.merge(feature_branch, "--no-ff")
+
+            # Run the action and expect for exception
+            printout(
+                "Run the GitHub action in a feature branch and expect for"
+                "AssociatedModelNotFound exception"
+            )
+            with pytest.raises(AssociatedModelNotFound):
+                run_github_action(
+                    workspace_path, git_repo, main_branch_name, "pull_request", is_deploy=True
+                )
+        printout("Done")
+
     @pytest.mark.parametrize("event_name", ["push", "pull_request"])
-    @pytest.mark.usefixtures(
-        "cleanup", "set_model_dataset_for_testing", "set_deployment_actuals_dataset"
-    )
+    @pytest.mark.usefixtures("set_model_dataset_for_testing", "set_deployment_actuals_dataset")
     def test_e2e_deployment_model_replacement(
         self,
         dr_client,
@@ -217,7 +264,7 @@ class TestDeploymentGitHubActions:
 
         # Disable challengers
         printout("Disable challengers ...")
-        self._enable_challenger(deployment_metadata, deployment_metadata_yaml_file, False)
+        self._enable_challenger(git_repo, deployment_metadata, deployment_metadata_yaml_file, False)
 
         (
             _,
@@ -264,9 +311,23 @@ class TestDeploymentGitHubActions:
 
         # Make a local change to the model and commit
         printout("Make a change to the model and run custom model GitHub action (push event) ...")
-        new_memory = increase_model_memory_by_1mb(model_metadata_yaml_file)
+        new_memory = increase_model_memory_by_1mb(
+            git_repo, model_metadata_yaml_file, do_commit=False
+        )
 
-        cls._commit_changes_by_event(f"Increase memory to {new_memory}", event_name, git_repo)
+        # Set the reason for the replacement
+        replace_and_store_schema(
+            model_metadata_yaml_file,
+            ModelSchema.VERSION_KEY,
+            ModelSchema.MODEL_REPLACEMENT_REASON_KEY,
+            metadata_or_value=ModelSchema.MODEL_REPLACEMENT_REASON_ERRORS,
+        )
+
+        cls._commit_changes_by_event(
+            f"Increase memory to {new_memory} and update the reason for replacement",
+            event_name,
+            git_repo,
+        )
 
         # Run the GitHub action to replace the latest model in a deployment
         printout(f"Run the GitHub action ({event_name} event)")
@@ -288,14 +349,21 @@ class TestDeploymentGitHubActions:
         return the_deployment, latest_deployment_model_version_id, latest_model_version
 
     @staticmethod
-    def _enable_challenger(deployment_metadata, deployment_metadata_yaml_file, enabled=True):
+    def _enable_challenger(
+        git_repo, deployment_metadata, deployment_metadata_yaml_file, enabled=True
+    ):
         settings = deployment_metadata.get(DeploymentSchema.SETTINGS_SECTION_KEY, {})
         settings[DeploymentSchema.ENABLE_CHALLENGER_MODELS_KEY] = enabled
         deployment_metadata[DeploymentSchema.SETTINGS_SECTION_KEY] = settings
-        with open(deployment_metadata_yaml_file, "w", encoding="utf-8") as fd:
-            yaml.safe_dump(deployment_metadata, fd)
+        save_new_metadata_and_commit(
+            deployment_metadata,
+            deployment_metadata_yaml_file,
+            git_repo,
+            "Enable challenger",
+        )
 
-    @pytest.mark.usefixtures("cleanup", "skip_model_testing", "set_deployment_actuals_dataset")
+    @pytest.mark.usefixtures("skip_model_testing", "set_deployment_actuals_dataset")
+    @pytest.mark.parametrize("github_event", ["push", "pull_request"])
     def test_e2e_deployment_delete(
         self,
         dr_client,
@@ -304,10 +372,11 @@ class TestDeploymentGitHubActions:
         deployment_metadata,
         deployment_metadata_yaml_file,
         main_branch_name,
+        github_event,
     ):
         """An end-to-end case to test a deployment deletion."""
 
-        # Create a model and deployment. Run the GitHub action.
+        # Setup: create a model and deployment. Run the GitHub action.
         printout("Run the GitHub action (push event) to create a model and deployment")
         run_github_action(workspace_path, git_repo, main_branch_name, "push", is_deploy=True)
         deployments = dr_client.fetch_deployments()
@@ -315,16 +384,20 @@ class TestDeploymentGitHubActions:
         assert any(d.get("userProvidedId") == local_user_provided_id for d in deployments)
 
         # Delete a deployment local definition yaml file
-        printout("Run the GitHub action (push event) to delete deployment")
-        os.remove(deployment_metadata_yaml_file)
-        self._commit_changes_by_event("Delete the deployment definition file", "push", git_repo)
+        printout(f"Run the GitHub action to delete deployment, github_event: {github_event}")
+        # Note: do not use os.remove, because it'll eventually remove the whole deployments
+        # directory in a feature branch.
+        os.rename(deployment_metadata_yaml_file, f"{deployment_metadata_yaml_file}.deleted")
+        self._commit_changes_by_event(
+            "Delete the deployment definition file", github_event, git_repo
+        )
 
         # Run the GitHub action but disallow deployment deletion
         run_github_action(
             workspace_path,
             git_repo,
             main_branch_name,
-            event_name="push",
+            event_name=github_event,
             is_deploy=True,
             allow_deployment_deletion=False,
         )
@@ -333,41 +406,29 @@ class TestDeploymentGitHubActions:
         local_user_provided_id = deployment_metadata[DeploymentSchema.DEPLOYMENT_ID_KEY]
         assert any(d.get("userProvidedId") == local_user_provided_id for d in deployments)
 
-        # Run the GitHub action (pull request) with allowed deployment deletion
-        printout("Run the GitHub action (pull request) with allowed deletion")
+        # Run the GitHub action with allowed deployment deletion
+        printout("Run the GitHub action with allowed deletion")
         run_github_action(
             workspace_path,
             git_repo,
             main_branch_name,
-            "pull_request",
+            github_event,
             is_deploy=True,
             allow_deployment_deletion=True,
         )
         printout("Validate ...")
         deployments = dr_client.fetch_deployments()
         local_user_provided_id = deployment_metadata[DeploymentSchema.DEPLOYMENT_ID_KEY]
-        assert any(d.get("userProvidedId") == local_user_provided_id for d in deployments)
-
-        # Run the GitHub action (push) with allowed deployment deletion
-        printout("Run the GitHub action (push) with allowed deletion")
-        run_github_action(
-            workspace_path,
-            git_repo,
-            main_branch_name,
-            "push",
-            is_deploy=True,
-            allow_deployment_deletion=True,
-        )
-        printout("Validate ...")
-        deployments = dr_client.fetch_deployments()
-        local_user_provided_id = deployment_metadata[DeploymentSchema.DEPLOYMENT_ID_KEY]
-        assert all(d.get("userProvidedId") != local_user_provided_id for d in deployments)
+        if github_event == "push":
+            assert all(d.get("userProvidedId") != local_user_provided_id for d in deployments)
+        elif github_event == "pull_request":
+            assert any(d.get("userProvidedId") == local_user_provided_id for d in deployments)
+        else:
+            assert False, f"GitHub event '{github_event}' is not supported!"
         printout("Done")
 
     @pytest.mark.parametrize("event_name", ["push", "pull_request"])
-    @pytest.mark.usefixtures(
-        "cleanup", "set_model_dataset_for_testing", "set_deployment_actuals_dataset"
-    )
+    @pytest.mark.usefixtures("set_model_dataset_for_testing", "set_deployment_actuals_dataset")
     def test_e2e_deployment_model_challengers(
         self,
         dr_client,
@@ -383,7 +444,7 @@ class TestDeploymentGitHubActions:
 
         # Enable challengers (although it is the default)
         printout("Enable challengers ...")
-        self._enable_challenger(deployment_metadata, deployment_metadata_yaml_file, True)
+        self._enable_challenger(git_repo, deployment_metadata, deployment_metadata_yaml_file, True)
 
         (
             the_deployment,
@@ -430,7 +491,7 @@ class TestDeploymentGitHubActions:
         """An end-to-end case to test changes in deployment settings."""
 
         with temporarily_upload_training_dataset_for_structured_model(
-            dr_client, model_metadata_yaml_file, event_name
+            dr_client, model_metadata_yaml_file, is_model_level=False, event_name=event_name
         ):
             try:
                 # Run the GitHub action to create a model and deployment
@@ -511,14 +572,9 @@ class TestDeploymentGitHubActions:
         deployment_attrs = [
             (DeploymentSchema.LABEL_KEY, "label"),
             (DeploymentSchema.DESCRIPTION_KEY, "description"),
-            (DeploymentSchema.IMPORTANCE_KEY, "importance"),
         ]
         for schema_attr, dr_attr in deployment_attrs:
-            old_value = origin_deployment[dr_attr]
-            if schema_attr == DeploymentSchema.IMPORTANCE_KEY:
-                new_value = "HIGH" if old_value == "LOW" else "LOW"
-            else:
-                new_value = f"{old_value} - NEW"
+            new_value = f"{origin_deployment[dr_attr]} - NEW"
             deployment_info.set_settings_value(schema_attr, value=new_value)
 
         with temporarily_replace_schema(deployment_metadata_yaml_file, deployment_info.metadata):
@@ -546,6 +602,8 @@ class TestDeploymentGitHubActions:
         event_name,
         github_output,
     ):
+        printout("Update deployment settings")
+
         deployment_info = DeploymentInfo(deployment_metadata_yaml_file, deployment_metadata)
         origin_deployment_settings = dr_client.fetch_deployment_settings(
             deployment["id"], deployment_info
@@ -619,7 +677,7 @@ class TestDeploymentGitHubActions:
             ] = deployment_info.get_settings_value(DeploymentSchema.ENABLE_FEATURE_DRIFT_KEY)
 
             expected_values[
-                DeploymentSchema.ENABLE_SEGMENT_ANALYSIS_KEY
+                DeploymentSchema.SEGMENT_ANALYSIS_KEY
             ] = deployment_info.get_settings_value(
                 DeploymentSchema.SEGMENT_ANALYSIS_KEY,
                 DeploymentSchema.ENABLE_SEGMENT_ANALYSIS_KEY,
@@ -639,7 +697,7 @@ class TestDeploymentGitHubActions:
             expected_values[DeploymentSchema.ENABLE_FEATURE_DRIFT_KEY] = origin_deployment_settings[
                 "featureDrift"
             ]["enabled"]
-            expected_values[DeploymentSchema.ENABLE_SEGMENT_ANALYSIS_KEY] = new_deployment_settings[
+            expected_values[DeploymentSchema.SEGMENT_ANALYSIS_KEY] = new_deployment_settings[
                 "segmentAnalysis"
             ]["enabled"]
             expected_values[
@@ -660,7 +718,7 @@ class TestDeploymentGitHubActions:
             == new_deployment_settings["featureDrift"]["enabled"]
         )
         assert (
-            expected_values[DeploymentSchema.ENABLE_SEGMENT_ANALYSIS_KEY]
+            expected_values[DeploymentSchema.SEGMENT_ANALYSIS_KEY]
             == new_deployment_settings["segmentAnalysis"]["enabled"]
         )
         assert (
@@ -685,7 +743,7 @@ class TestDeploymentGitHubActions:
             Namespace.uninit()
             Namespace.init(origin_namespace)
 
-    @pytest.mark.usefixtures("cleanup", "skip_model_testing", "set_deployment_actuals_dataset")
+    @pytest.mark.usefixtures("skip_model_testing", "set_deployment_actuals_dataset")
     def test_deployment_and_model_fetch_for_different_namespaces(
         self, dr_client, workspace_path, git_repo, main_branch_name
     ):
@@ -714,3 +772,35 @@ class TestDeploymentGitHubActions:
 
             custom_models = dr_client.fetch_custom_models()
             assert len(custom_models) == 0
+
+    @pytest.mark.usefixtures("skip_model_testing", "skip_association")
+    def test_e2e_deployment_create_failure(
+        self, workspace_path, git_repo, model_metadata_yaml_file, main_branch_name, caplog
+    ):
+        """
+        An end-to-end case to test a failure of a background job during a deployment's creation.
+        """
+
+        printout("Run the GitHub action to create an erroneous model and deployment")
+        with self._simulate_model_error(model_metadata_yaml_file):
+            with pytest.raises(DataRobotClientError) as exec_info:
+                with caplog.at_level(logging.WARNING):
+                    run_github_action(
+                        workspace_path, git_repo, main_branch_name, "push", is_deploy=True
+                    )
+
+            printout(str(exec_info.value))
+            assert any(record.levelname in ("WARNING", "ERROR") for record in caplog.records)
+            assert "WARNING" in str(exec_info.value) or "ERROR" in str(exec_info.value)
+        printout("Done")
+
+    @contextlib.contextmanager
+    def _simulate_model_error(self, model_metadata_yaml_file):
+        model_dir_path = Path(model_metadata_yaml_file).parent
+        try:
+            origin_pickle_file_path = next(model_dir_path.rglob("*.pkl"))
+        except StopIteration:
+            assert False, "Missing model's pickle artifact"
+        tmp_pickle_file_path = origin_pickle_file_path.rename(f"{origin_pickle_file_path}.bak")
+        yield
+        tmp_pickle_file_path.rename(origin_pickle_file_path)

@@ -56,7 +56,7 @@ class TestModelSchemaValidator:
 
     @pytest.mark.parametrize(
         "binary_target_type",
-        [ModelSchema.TARGET_TYPE_BINARY_KEY, ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY_KEY],
+        [ModelSchema.TARGET_TYPE_BINARY, ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY],
     )
     @pytest.mark.parametrize("is_single", [True, False], ids=["single", "multi"])
     def test_for_binary_model(self, binary_target_type, is_single):
@@ -108,7 +108,7 @@ class TestModelSchemaValidator:
 
     @pytest.mark.parametrize(
         "binary_target_type",
-        [ModelSchema.TARGET_TYPE_BINARY_KEY, ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY_KEY],
+        [ModelSchema.TARGET_TYPE_BINARY, ModelSchema.TARGET_TYPE_UNSTRUCTURED_BINARY],
     )
     @pytest.mark.parametrize(
         "class_label_key",
@@ -129,8 +129,8 @@ class TestModelSchemaValidator:
     @pytest.mark.parametrize(
         "regression_target_type",
         [
-            ModelSchema.TARGET_TYPE_REGRESSION_KEY,
-            ModelSchema.TARGET_TYPE_UNSTRUCTURED_REGRESSION_KEY,
+            ModelSchema.TARGET_TYPE_REGRESSION,
+            ModelSchema.TARGET_TYPE_UNSTRUCTURED_REGRESSION,
         ],
     )
     @pytest.mark.parametrize("is_single", [True, False], ids=["single", "multi"])
@@ -145,8 +145,8 @@ class TestModelSchemaValidator:
     @pytest.mark.parametrize(
         "multiclass_target_type",
         [
-            ModelSchema.TARGET_TYPE_MULTICLASS_KEY,
-            ModelSchema.TARGET_TYPE_UNSTRUCTURED_MULTICLASS_KEY,
+            ModelSchema.TARGET_TYPE_MULTICLASS,
+            ModelSchema.TARGET_TYPE_UNSTRUCTURED_MULTICLASS,
         ],
     )
     @pytest.mark.parametrize("is_single", [True, False], ids=["single", "multi"])
@@ -164,7 +164,7 @@ class TestModelSchemaValidator:
         """A case to test a missing key in a Multi-Class model schema."""
 
         def _set_multiclass_keys(schema):
-            schema[ModelSchema.TARGET_TYPE_KEY] = ModelSchema.TARGET_TYPE_MULTICLASS_KEY
+            schema[ModelSchema.TARGET_TYPE_KEY] = ModelSchema.TARGET_TYPE_MULTICLASS
 
         with pytest.raises(InvalidModelSchema):
             self._validate_for_model_type(is_single, _set_multiclass_keys)
@@ -174,7 +174,7 @@ class TestModelSchemaValidator:
         """A case to test an unstructured model schema."""
 
         def _set_unstructured_keys(schema):
-            schema[ModelSchema.TARGET_TYPE_KEY] = ModelSchema.TARGET_TYPE_UNSTRUCTURED_OTHER_KEY
+            schema[ModelSchema.TARGET_TYPE_KEY] = ModelSchema.TARGET_TYPE_UNSTRUCTURED_OTHER
 
         self._validate_for_model_type(is_single, _set_unstructured_keys)
 
@@ -185,24 +185,24 @@ class TestModelSchemaValidator:
         Key = namedtuple("Key", ["type", "name", "value"])
         mutual_exclusive_keys = {
             Key(
-                type=ModelSchema.TARGET_TYPE_REGRESSION_KEY,
+                type=ModelSchema.TARGET_TYPE_REGRESSION,
                 name=ModelSchema.PREDICTION_THRESHOLD_KEY,
                 value=0.5,
             ),
             (
                 Key(
-                    type=ModelSchema.TARGET_TYPE_BINARY_KEY,
+                    type=ModelSchema.TARGET_TYPE_BINARY,
                     name=ModelSchema.POSITIVE_CLASS_LABEL_KEY,
                     value="1",
                 ),
                 Key(
-                    type=ModelSchema.TARGET_TYPE_BINARY_KEY,
+                    type=ModelSchema.TARGET_TYPE_BINARY,
                     name=ModelSchema.NEGATIVE_CLASS_LABEL_KEY,
                     value="0",
                 ),
             ),
             Key(
-                type=ModelSchema.TARGET_TYPE_MULTICLASS_KEY,
+                type=ModelSchema.TARGET_TYPE_MULTICLASS,
                 name=ModelSchema.CLASS_LABELS_KEY,
                 value=("a", "b", "c"),
             ),
@@ -230,7 +230,8 @@ class TestModelSchemaValidator:
                 self._validate_schema(is_single, model_schema)
 
     @pytest.mark.parametrize("is_single", [True, False], ids=["single", "multi"])
-    def test_invalid_mutual_exclusive_keys_partitioning_and_holdout(self, is_single):
+    @pytest.mark.parametrize("section", [ModelSchema.SETTINGS_SECTION_KEY, ModelSchema.VERSION_KEY])
+    def test_invalid_mutual_exclusive_keys_partitioning_and_holdout(self, is_single, section):
         """
         A case to test an invalid mutual exclusive keys related to partitioning and holdout
         attributes.
@@ -243,18 +244,55 @@ class TestModelSchemaValidator:
             if is_single
             else model_metadata[ModelSchema.MULTI_MODELS_KEY][0][ModelSchema.MODEL_ENTRY_META_KEY]
         )
-        edit_metadata[ModelSchema.SETTINGS_SECTION_KEY][ModelSchema.HOLDOUT_DATASET_ID_KEY] = str(
-            ObjectId()
-        )
-        edit_metadata[ModelSchema.SETTINGS_SECTION_KEY][
-            ModelSchema.PARTITIONING_COLUMN_KEY
-        ] = "holdout"
+        edit_metadata[section][ModelSchema.PARTITIONING_COLUMN_KEY] = "partitioning"
+        edit_metadata[section][ModelSchema.HOLDOUT_DATASET_ID_KEY] = str(ObjectId())
 
         with pytest.raises(InvalidModelSchema):
             if is_single:
                 ModelSchema.validate_and_transform_single(model_metadata)
             else:
                 ModelSchema.validate_and_transform_multi(model_metadata)
+
+    @pytest.mark.parametrize("is_single", [True, False], ids=["single", "multi"])
+    @pytest.mark.parametrize("is_unstructured", [True, False], ids=["unstructured", "structured"])
+    @pytest.mark.parametrize("with_holdout", [True, False], ids=["with-holdout", "without-holdout"])
+    def test_invalid_mutual_exclusive_training_and_holdout_keys_between_settings_and_version(
+        self, is_single, is_unstructured, with_holdout
+    ):
+        """
+        A case to test an invalid mutual exclusive keys between model settings section and version
+        section, related to training and holdout dataset attributes.
+        """
+
+        model_metadata = create_partial_model_schema(is_single, num_models=1, with_target_type=True)
+
+        edit_metadata = (
+            model_metadata
+            if is_single
+            else model_metadata[ModelSchema.MULTI_MODELS_KEY][0][ModelSchema.MODEL_ENTRY_META_KEY]
+        )
+        sections_in_test = [ModelSchema.SETTINGS_SECTION_KEY, ModelSchema.VERSION_KEY]
+        for index in range(2):
+            section_one = sections_in_test[index]
+            section_two = sections_in_test[index ^ 1]
+            if is_unstructured:
+                edit_metadata[section_one][ModelSchema.TRAINING_DATASET_ID_KEY] = str(ObjectId())
+                edit_metadata[section_two][ModelSchema.TRAINING_DATASET_ID_KEY] = str(ObjectId())
+                if with_holdout:
+                    edit_metadata[section_one][ModelSchema.HOLDOUT_DATASET_ID_KEY] = str(ObjectId())
+                    edit_metadata[section_two][ModelSchema.HOLDOUT_DATASET_ID_KEY] = str(ObjectId())
+            else:
+                edit_metadata[section_one][ModelSchema.TRAINING_DATASET_ID_KEY] = str(ObjectId())
+                edit_metadata[section_two][ModelSchema.TRAINING_DATASET_ID_KEY] = str(ObjectId())
+                if with_holdout:
+                    edit_metadata[section_one][ModelSchema.PARTITIONING_COLUMN_KEY] = "partitioning"
+                    edit_metadata[section_two][ModelSchema.PARTITIONING_COLUMN_KEY] = "partitioning"
+
+            with pytest.raises(InvalidModelSchema):
+                if is_single:
+                    ModelSchema.validate_and_transform_single(model_metadata)
+                else:
+                    ModelSchema.validate_and_transform_multi(model_metadata)
 
     @pytest.mark.parametrize("is_single", [True, False], ids=["single", "multi"])
     @pytest.mark.parametrize(
@@ -450,6 +488,20 @@ class TestModelSchemaSetValue:
         key_name = ModelSchema.NAME_KEY
         with pytest.raises(UnexpectedType):
             ModelSchema.set_value(input_metadata, section_name, key_name, value=value)
+
+    def test_target_type_value_definitions_are_all_included(self):
+        """
+        A case to test that all the target type value definitions are included in the target type
+        attribute in the model's schema.
+        """
+
+        target_type_value_definitions = {
+            v
+            for k, v in ModelSchema.__dict__.items()
+            if k.startswith("TARGET_TYPE_") and not k.endswith("_KEY")
+        }
+        target_type_choices = set(ModelSchema.MODEL_SCHEMA.schema["target_type"].args)
+        assert target_type_value_definitions == target_type_choices
 
 
 class TestDeploymentSchemaValidator:

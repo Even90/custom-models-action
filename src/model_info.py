@@ -19,12 +19,19 @@ from typing import List
 
 from model_file_path import ModelFilePath
 from schema_validator import ModelSchema
+from schema_validator import SharedSchema
 
 logger = logging.getLogger()
 
 
+# pylint: disable=too-many-public-methods
 class InfoBase(ABC):
     """An abstract base class for models and deployments information classes."""
+
+    @property
+    @abstractmethod
+    def schema_validator(self):
+        """The schema validator glass."""
 
     @property
     @abstractmethod
@@ -44,10 +51,9 @@ class InfoBase(ABC):
         the metadata.
         """
 
-    @abstractmethod
     def get_value(self, key, *sub_keys):
         """
-        Get a value from the model's metadata given a key and sub-keys.
+        Get a value from the entity metadata given a key and sub-keys.
 
         Parameters
         ----------
@@ -62,7 +68,8 @@ class InfoBase(ABC):
             The value associated with the provided key (and sub-keys) or None if not exists.
         """
 
-    @abstractmethod
+        return self.schema_validator.get_value(self.metadata, key, *sub_keys)
+
     def get_settings_value(self, key, *sub_keys):
         """
         Get a value from the metadata settings section, given a key and sub-keys under
@@ -82,6 +89,49 @@ class InfoBase(ABC):
         Any or None,
             The value associated with the provided key (and sub-keys) or None if not exists.
         """
+        return self.get_value(self.schema_validator.SETTINGS_SECTION_KEY, key, *sub_keys)
+
+    def set_value(self, key, *sub_keys, value):
+        """
+        Set a value in an entity metadata.
+
+        Parameters
+        ----------
+        key : str
+            A key name of an entity schema.
+        sub_keys : list
+            An optional dynamic sub-keys from the entity schema.
+        value : Any
+            A value to set for the given key and optionally sub keys.
+
+        Returns
+        -------
+        dict,
+            The revised metadata after the value was set.
+        """
+
+        return self.schema_validator.set_value(self.metadata, key, *sub_keys, value=value)
+
+    def set_settings_value(self, key, *sub_keys, value):
+        """
+        Set a value in the entity metadata settings section.
+
+        Parameters
+        ----------
+        key : str
+            A key from the SharedSchema.SETTINGS_SECTION_KEY of the given schema validator.
+        sub_keys: list
+            An optional dynamic sub-keys from the enity schema.
+        value : Any
+            A value to set.
+
+        Returns
+        -------
+        dict,
+            The revised metadata after the value was set.
+        """
+
+        return self.set_value(SharedSchema.SETTINGS_SECTION_KEY, key, *sub_keys, value=value)
 
 
 class ModelInfo(InfoBase):
@@ -128,6 +178,12 @@ class ModelInfo(InfoBase):
         self._model_file_paths = {}
         self.file_changes = self.FileChanges()
         self.flags = self.Flags()
+
+    @property
+    def schema_validator(self):
+        """Return the schema validator class."""
+
+        return ModelSchema
 
     @property
     def yaml_filepath(self):
@@ -226,30 +282,119 @@ class ModelInfo(InfoBase):
     def is_affected_by_commit(self, datarobot_latest_model_version):
         """Whether the given model is affected by the last commit"""
 
-        return self.flags.should_update_settings or self.should_create_new_version(
-            datarobot_latest_model_version
+        return (
+            self.flags.should_update_settings
+            or self.should_create_new_version(datarobot_latest_model_version)
+            or self.is_there_a_change_in_training_or_holdout_data_at_version_level(
+                datarobot_latest_model_version
+            )
         )
 
     def should_create_new_version(self, datarobot_latest_model_version):
         """Whether a new custom inference model version should be created"""
 
         if (
-            self.flags.should_upload_all_files
+            not datarobot_latest_model_version
+            or self.flags.should_upload_all_files
             or bool(self.file_changes.changed_or_new_files)
             or bool(self.file_changes.deleted_file_ids)
-            or not datarobot_latest_model_version
         ):
+            logger.debug(
+                "Need to create new version. datarobot_latest_model_version:%s "
+                "should_upload_all_files:%s changed_or_new_files:%s deleted_file_ids:%s",
+                datarobot_latest_model_version,
+                self.flags.should_upload_all_files,
+                self.file_changes.changed_or_new_files,
+                self.file_changes.deleted_file_ids,
+            )
             return True
 
-        configured_memory = self.get_value(ModelSchema.VERSION_KEY, ModelSchema.MEMORY_KEY)
-        if configured_memory != datarobot_latest_model_version.get("maximumMemory"):
-            return True
-
-        configured_replicas = self.get_value(ModelSchema.VERSION_KEY, ModelSchema.REPLICAS_KEY)
-        if configured_replicas != datarobot_latest_model_version.get("replicas"):
-            return True
+        for resource_key, dr_attribute_key in (
+            (ModelSchema.MEMORY_KEY, "maximumMemory"),
+            (ModelSchema.REPLICAS_KEY, "replicas"),
+            (ModelSchema.EGRESS_NETWORK_POLICY_KEY, "networkEgressPolicy"),
+        ):
+            configured_resource = self.get_value(ModelSchema.VERSION_KEY, resource_key)
+            if configured_resource and configured_resource != datarobot_latest_model_version.get(
+                dr_attribute_key
+            ):
+                logger.debug(
+                    "Need to create new version. Resource '%s' changed. "
+                    "Configured value: '%s' Value on server: '%s'",
+                    resource_key,
+                    configured_resource,
+                    datarobot_latest_model_version.get(dr_attribute_key),
+                )
+                return True
 
         return False
+
+    def is_there_a_change_in_training_or_holdout_data_at_version_level(
+        self, datarobot_latest_model_version
+    ):
+        """Whether there's a model's version configuration change of a training/holdout data."""
+
+        # Check training dataset
+        configured_training_dataset = self.get_value(
+            ModelSchema.VERSION_KEY, ModelSchema.TRAINING_DATASET_ID_KEY
+        )
+        if datarobot_latest_model_version is None:
+            # This can happen only when the custom model is first created and still does not have
+            # any associated version. A hidden assumption is that a holdout data will never be set
+            # without a training data
+            return configured_training_dataset is not None
+
+        latest_training_dataset = datarobot_latest_model_version.get("training_data", {}).get(
+            "dataset_id"
+        )
+        if configured_training_dataset != latest_training_dataset:
+            logger.debug("Configured training dataset != latest training dataset")
+            return True
+
+        # Check holdout
+        if self.is_unstructured:
+            configured_holdout_dataset = self.get_value(
+                ModelSchema.VERSION_KEY, ModelSchema.TRAINING_DATASET_ID_KEY
+            )
+            latest_holdout_dataset = datarobot_latest_model_version.get("holdout_data", {}).get(
+                "dataset_id"
+            )
+            if configured_holdout_dataset != latest_holdout_dataset:
+                logger.debug("Configured holdout dataset != latest holdout dataset")
+                return True
+
+        else:
+            configured_holdout_partition = self.get_value(
+                ModelSchema.VERSION_KEY, ModelSchema.PARTITIONING_COLUMN_KEY
+            )
+            latest_partition = datarobot_latest_model_version.get("holdout_data", {}).get(
+                "partition_column"
+            )
+            if configured_holdout_partition != latest_partition:
+                logger.debug("Configured holdout partition != latest holdout partition")
+                return True
+
+        return False
+
+    @property
+    def should_register_model(self):
+        """Wheter this model should be added as a registered model."""
+        return self.registered_model_name is not None
+
+    @property
+    def registered_model_name(self):
+        """The registered model name to use or None if model should not be registered."""
+        return self.get_value(ModelSchema.MODEL_REGISTRY_KEY, ModelSchema.MODEL_NAME)
+
+    @property
+    def registered_model_description(self):
+        """The registered model description to use or None if model should not be registered."""
+        return self.get_value(ModelSchema.MODEL_REGISTRY_KEY, ModelSchema.MODEL_DESCRIPTION)
+
+    @property
+    def registered_model_global(self):
+        """Wheter the registered model should be global or not."""
+        return self.get_value(ModelSchema.MODEL_REGISTRY_KEY, ModelSchema.GLOBAL)
 
     @property
     def should_run_test(self):
@@ -259,44 +404,3 @@ class ModelInfo(InfoBase):
         return ModelSchema.TEST_KEY in self.metadata and not self.get_value(
             ModelSchema.TEST_KEY, ModelSchema.TEST_SKIP_KEY
         )
-
-    def get_value(self, key, *sub_keys):
-        """
-        Get a value from the model's metadata given a key and sub-keys.
-
-        Parameters
-        ----------
-        key : str
-            A key name from the ModelSchema.
-        sub_keys :
-            An optional dynamic sub-keys from the ModelSchema.
-
-        Returns
-        -------
-        Any or None,
-            The value associated with the provided key (and sub-keys) or None if not exists.
-        """
-
-        return ModelSchema.get_value(self.metadata, key, *sub_keys)
-
-    def get_settings_value(self, key, *sub_keys):
-        """
-        Get a value from the model's metadata settings section, given a key and sub-keys under
-        the settings section.
-
-        Parameters
-        ----------
-        key : str
-            A key name from the ModelSchema, which is supposed to be under the
-            SharedSchema.SETTINGS_SECTION_KEY section.
-        sub_keys :
-            An optional dynamic sub-keys from the ModelSchema, which are under the
-            SharedSchema.SETTINGS_SECTION_KEY section.
-
-        Returns
-        -------
-        Any or None,
-            The value associated with the provided key (and sub-keys) or None if not exists.
-        """
-
-        return self.get_value(ModelSchema.SETTINGS_SECTION_KEY, key, *sub_keys)

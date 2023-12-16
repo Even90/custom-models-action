@@ -28,6 +28,7 @@ from common.exceptions import ModelMainEntryPointNotFound
 from common.exceptions import ModelMetadataAlreadyExists
 from common.exceptions import SharedAndLocalPathCollision
 from common.exceptions import UnexpectedResult
+from common.git_model_version import GitModelVersion
 from common.git_tool import GitTool
 from common.github_env import GitHubEnv
 from dr_client import DrClient
@@ -119,6 +120,7 @@ class ModelController(ControllerBase):
         self._models_info = {}
         self._datarobot_models = {}
         self._datarobot_models_by_id = {}
+        self._git_model_version = GitModelVersion(repo, options.branch)
 
     def _label(self):
         return constants.Label.MODELS
@@ -331,7 +333,10 @@ class ModelController(ControllerBase):
         self._lookup_affected_models()
 
     def _should_upload_all_files(self, model_info):
-        return not self._model_version_exists(model_info) or not self._valid_ancestor(model_info)
+        return not (
+            self._model_version_exists(model_info)
+            and self._valid_model_version_ancestor(model_info)
+        )
 
     def _model_version_exists(self, model_info):
         return (
@@ -339,7 +344,7 @@ class ModelController(ControllerBase):
             and self.datarobot_models[model_info.user_provided_id].latest_version
         )
 
-    def _valid_ancestor(self, model_info):
+    def _valid_model_version_ancestor(self, model_info):
         ancestor_sha = self._get_latest_model_version_git_commit_ancestor(model_info)
         if not ancestor_sha:
             return False
@@ -370,12 +375,12 @@ class ModelController(ControllerBase):
         """
         The attribute name from DataRobot public API that should be taken into account, depending
         on the event that triggered the workflow and a reference name that is associated
-        with the latest custom model version.
+        with the given custom model version.
 
         Parameters
         ----------
         git_model_version : dict
-            The GitModelVersion from a DataRobot custom inference model version entity.
+            The GitModelVersion from a DataRobot custom inference model or version entity.
 
         Returns
         -------
@@ -383,11 +388,8 @@ class ModelController(ControllerBase):
             The DataRobot public API attribute name.
         """
 
-        latest_custom_model_version_ref_name = git_model_version["refName"]
-        if (
-            GitHubEnv.is_pull_request()
-            and GitHubEnv.ref_name() == latest_custom_model_version_ref_name
-        ):
+        latest_ref_name = git_model_version["refName"]
+        if GitHubEnv.is_pull_request() and GitHubEnv.ref_name() == latest_ref_name:
             return "pullRequestCommitSha"
         return "mainBranchCommitSha"
 
@@ -400,47 +402,50 @@ class ModelController(ControllerBase):
             model_info.file_changes = ModelInfo.FileChanges()
 
             logger.debug(
-                "Searching model %s changes since its last DR version.", model_info.user_provided_id
-            )
-            if model_info.flags.should_upload_all_files:
-                logger.debug("Model %s will upload all its files.", model_info.user_provided_id)
-                continue
-
-            from_commit_sha = self._get_latest_model_version_git_commit_ancestor(model_info)
-            if not from_commit_sha:
-                raise UnexpectedResult(
-                    "Unexpected None ancestor commit sha, "
-                    f"model_git_id: {model_info.user_provided_id}"
-                )
-            changed_files, deleted_files = self._repo.find_changed_files(
-                GitHubEnv.github_sha(), from_commit_sha
-            )
-            logger.debug(
-                "Model: %s, referenced commit %s. changed files: %s. deleted files: %s.",
+                "Searching model %s changes since its last update in DR.",
                 model_info.user_provided_id,
-                from_commit_sha,
-                changed_files,
-                deleted_files,
             )
-            self._handle_changed_or_new_files(model_info, changed_files)
+            self._handle_affected_models_by_settings(model_info)
+            self._handle_affected_models_by_versions(model_info)
             self._handle_deleted_files(model_info)
 
-    @classmethod
-    def _handle_changed_or_new_files(cls, model_info, changed_or_new_files):
-        for changed_file in changed_or_new_files:
-            changed_model_filepath = model_info.model_file_paths.get(changed_file)
-            if changed_model_filepath:
-                logger.debug(
-                    "Changed/new file '%s' affects model '%s'",
-                    changed_file,
-                    model_info.model_path.name,
-                )
-                model_info.file_changes.add_changed(changed_model_filepath)
+    def _handle_affected_models_by_settings(self, model_info):
+        if not self.datarobot_models.get(model_info.user_provided_id):
+            # The model has not yet been created or
+            return
 
-            cls._mark_changes_in_model_settings(model_info, changed_file)
+        from_commit_sha = self._get_git_commit_ancestor(model_info)
+        if not from_commit_sha:
+            raise UnexpectedResult(
+                "Unexpected None ancestor commit sha, "
+                f"model_git_id: {model_info.user_provided_id}"
+            )
+        changed_files, deleted_files = self._repo.find_changed_files(
+            GitHubEnv.github_sha(), from_commit_sha
+        )
+        logger.debug(
+            "Affected by settings, model: %s, referenced commit %s. changed files: %s. deleted "
+            "files: %s.",
+            model_info.user_provided_id,
+            from_commit_sha,
+            changed_files,
+            deleted_files,
+        )
+        for changed_file in changed_files:
+            self._mark_changes_in_model_settings(model_info, changed_file)
 
-    @classmethod
-    def _mark_changes_in_model_settings(cls, model_info, changed_file):
+    def _get_git_commit_ancestor(self, model_info):
+        model = self.datarobot_models[model_info.user_provided_id].model
+        git_model_version = model.get("gitModelVersion")
+        if not git_model_version:
+            raise UnexpectedResult(
+                "Unexpected empty git model version in DataRobot model, "
+                f"model_git_id: {model_info.user_provided_id}"
+            )
+
+        return git_model_version[self.ancestor_attribute_ref(git_model_version)]
+
+    def _mark_changes_in_model_settings(self, model_info, changed_file):
         # A change may happen in the model's definition (yaml), which is not necessarily
         # included by the glob patterns
         if any(changed_file.suffix == suffix for suffix in [".yaml", ".yml"]):
@@ -450,9 +455,77 @@ class ModelController(ControllerBase):
                 model_info.yaml_filepath,
                 changed_file,
             )
-            if model_info.yaml_filepath.samefile(changed_file):
+            # With the following condition, the model's settings will remain untouched in DataRobot
+            # unless there was a local change to the related model's definition in the settings
+            # section. It means that if the user made a change via the UI, this change will not
+            # be overriden until a local change will be detected.
+            if model_info.yaml_filepath.samefile(changed_file) and self._should_settings_be_updated(
+                model_info
+            ):
                 logger.debug("The model's settings were changed. path %s", model_info.model_path)
                 model_info.flags.should_update_settings = True
+
+    def _should_settings_be_updated(self, model_info):
+        datarobot_model = self.datarobot_models[model_info.user_provided_id].model
+        dr_model_settings_update_payload = self._dr_client.get_settings_patch_payload(
+            model_info, datarobot_model
+        )
+        return bool(
+            dr_model_settings_update_payload
+            or self._should_training_holdout_data_be_updated_at_model_level(
+                model_info, datarobot_model
+            )
+        )
+
+    def _should_training_holdout_data_be_updated_at_model_level(self, model_info, datarobot_model):
+        training_holdout_changes_at_model_level = (
+            self._dr_client.get_training_holdout_patch_payload_at_model_level(
+                model_info, datarobot_model
+            )
+        )
+        is_training_enabled_for_version = datarobot_model.get(
+            "isTrainingDataForVersionsPermanentlyEnabled", False
+        )
+        if training_holdout_changes_at_model_level and is_training_enabled_for_version:
+            logger.warning(
+                "Changes of training/holdout data at model level are ignored, because the given"
+                "model was already set to handle training/holdout data at version level. "
+                "Model path: %s",
+                model_info.model_path,
+            )
+        return bool(training_holdout_changes_at_model_level and not is_training_enabled_for_version)
+
+    def _handle_affected_models_by_versions(self, model_info):
+        if model_info.flags.should_upload_all_files:
+            logger.debug("Model %s will upload all its files.", model_info.user_provided_id)
+            return
+
+        from_commit_sha = self._get_latest_model_version_git_commit_ancestor(model_info)
+        if not from_commit_sha:
+            raise UnexpectedResult(
+                "Unexpected None ancestor commit sha, "
+                f"model_git_id: {model_info.user_provided_id}"
+            )
+        changed_files, deleted_files = self._repo.find_changed_files(
+            GitHubEnv.github_sha(), from_commit_sha
+        )
+        logger.debug(
+            "Affected by versions, model: %s, referenced commit %s. changed files: %s. deleted "
+            "files: %s.",
+            model_info.user_provided_id,
+            from_commit_sha,
+            changed_files,
+            deleted_files,
+        )
+        for changed_file in changed_files:
+            changed_model_filepath = model_info.model_file_paths.get(changed_file)
+            if changed_model_filepath:
+                logger.debug(
+                    "Changed/new file '%s' affects model '%s'",
+                    changed_file,
+                    model_info.model_path.name,
+                )
+                model_info.file_changes.add_changed(changed_model_filepath)
 
     def _handle_deleted_files(self, model_info):
         """
@@ -506,7 +579,7 @@ class ModelController(ControllerBase):
         for user_provided_id, model_info in self.models_info.items():
             already_exists = user_provided_id in self.datarobot_models
             custom_model = self.datarobot_models[user_provided_id].model if already_exists else None
-            latest_version = (
+            previous_latest_version = latest_version = (
                 self.datarobot_models[user_provided_id].latest_version if already_exists else None
             )
 
@@ -519,39 +592,95 @@ class ModelController(ControllerBase):
                         self.metrics.total_created.value += 1
 
                     custom_model_id = custom_model["id"]
-                    latest_version = self._create_custom_model_version(custom_model_id, model_info)
-                    self.datarobot_models[user_provided_id].latest_version = latest_version
-
-                    self.metrics.total_created_versions.value += 1
-                    logger.info(
-                        "Custom inference model version was successfully created. "
-                        "user_provided_id: %s, model_id: %s, version_id: %s.",
-                        user_provided_id,
-                        custom_model_id,
-                        latest_version["id"],
+                    is_major_update = bool(latest_version and latest_version["isFrozen"])
+                    latest_version = self._create_custom_model_version(
+                        custom_model_id, is_major_update, model_info
                     )
-
+                    self._cache_new_custom_model_version(user_provided_id, latest_version)
                     self._dr_client.build_dependency_environment_if_required(latest_version)
-                else:
-                    if GitHubEnv.is_push():
-                        # Upon pushing to the main branch, If the model was somehow affected by the
-                        # given event, make sure to update the main branch commit SHA. This solves
-                        # an issue of follow-up pull requests, which are not related to the given
-                        # model that should not affect the given model.
-                        latest_version = self._update_custom_model_version_git_attributes(
-                            model_info, latest_version
+
+                if model_info.is_there_a_change_in_training_or_holdout_data_at_version_level(
+                    latest_version
+                ):
+                    latest_version = (
+                        self._dr_client.create_version_from_latest_with_training_and_holdout_data(
+                            model_info, custom_model, self._git_model_version
                         )
-                        self.datarobot_models[user_provided_id].latest_version = latest_version
+                    )
+                    self._cache_new_custom_model_version(user_provided_id, latest_version)
 
                 if model_info.flags.should_update_settings:
                     self._update_settings(custom_model, model_info)
 
-                if model_info.should_run_test:
-                    self._test_custom_model_version(
-                        custom_model["id"], latest_version["id"], model_info
-                    )
-
                 self.metrics.total_affected.value += 1
+            else:
+                custom_model, latest_version = self._update_git_model_version_following_merging(
+                    model_info, custom_model, latest_version
+                )
+
+            # Running a test is an action and is not directly considered as a change of a model
+            # or a version. It's possible, for instance, that the only change in a given run
+            # is the fact that the user enabled the testing, applying any settings of creating
+            # a new version.
+            if self._should_run_custom_model_test(
+                model_info, custom_model, previous_latest_version, latest_version
+            ):
+                self._test_custom_model_version(
+                    custom_model["id"], latest_version["id"], model_info
+                )
+
+            if model_info.should_register_model:
+                self._dr_client.create_or_update_registered_model(
+                    latest_version["id"], model_info.registered_model_name
+                )
+                self._dr_client.update_registered_model(
+                    model_info.registered_model_name,
+                    model_info.registered_model_description,
+                    model_info.registered_model_global,
+                )
+
+    @staticmethod
+    def _was_new_version_created(previous_latest_version, latest_version):
+        return not previous_latest_version or latest_version["id"] != previous_latest_version["id"]
+
+    def _should_run_custom_model_test(
+        self, model_info, datarobot_custom_model, previous_latest_version, latest_version
+    ):
+        if not model_info.should_run_test:
+            return False
+
+        if self._was_new_version_created(previous_latest_version, latest_version):
+            return True
+
+        # The rest of the code makes sure that changes in the model's metadata test section
+        # will trigger the test if required.
+
+        # It is enough to fetch a single test and check it against the latest version.
+        custom_model_tests = self._dr_client.fetch_custom_model_tests(
+            custom_model_id=datarobot_custom_model["id"], limit=1
+        )
+        if not custom_model_tests:
+            return True
+
+        if custom_model_tests[0]["customModelVersion"]["id"] != latest_version["id"]:
+            return True
+
+        # NOTE: it is still desired to examine changes in the checks under the test section, and
+        # trigger the test accordingly. But will leave it for now for the future.
+
+        return False
+
+    def _cache_new_custom_model_version(self, user_provided_id, latest_version):
+        self.datarobot_models[user_provided_id].latest_version = latest_version
+
+        self.metrics.total_created_versions.value += 1
+        logger.info(
+            "A custom inference model version was successfully created. "
+            "user_provided_id: %s, model_id: %s, version_id: %s.",
+            user_provided_id,
+            latest_version["customModelId"],
+            latest_version["id"],
+        )
 
     def _update_custom_model_version_git_attributes(self, model_info, custom_model_version):
         main_branch_commit_sha = GitHubEnv.github_sha()
@@ -572,21 +701,24 @@ class ModelController(ControllerBase):
         )
 
     def _create_custom_model(self, model_info):
-        custom_model = self._dr_client.create_custom_model(model_info)
+        custom_model = self._dr_client.create_custom_model(model_info, self._git_model_version)
+
         self._set_datarobot_custom_model(model_info.user_provided_id, custom_model)
         logger.info("Custom inference model was created: %s", custom_model["id"])
         return custom_model
 
-    def _create_custom_model_version(self, custom_model_id, model_info):
+    def _create_custom_model_version(self, custom_model_id, is_major_update, model_info):
         if model_info.flags.should_upload_all_files:
             changed_file_paths = list(model_info.model_file_paths.values())
         else:
             changed_file_paths = model_info.file_changes.changed_or_new_files
 
         logger.info(
-            "Create custom inference model version. user_provided_id:  %s, from_latest: %s",
+            "Create custom inference model version. user_provided_id:  %s, from_latest: %s, "
+            "is_major=%s",
             model_info.user_provided_id,
             model_info.flags.should_create_version_from_latest,
+            is_major_update,
         )
         logger.debug(
             "Files to be uploaded: %s, user_provided_id: %s",
@@ -594,49 +726,47 @@ class ModelController(ControllerBase):
             model_info.user_provided_id,
         )
 
-        if GitHubEnv.is_pull_request():
-            if self._repo.num_remotes() == 0:
-                # Only to support the functional tests, which do not have a remote repository.
-                main_branch = self.options.branch
-            else:
-                # This is the expected path when working against a remote GitHub repository.
-                main_branch = f"{self._repo.remote_name()}/{self.options.branch}"
-            main_branch_commit_sha = self._repo.merge_base_commit_sha(
-                main_branch, GitHubEnv.github_sha()
-            )
-            pull_request_commit_sha = self._repo.feature_branch_top_commit_sha_of_a_merge_commit(
-                GitHubEnv.github_sha()
-            )
-            commit_url = GitTool.GITHUB_COMMIT_URL_PATTERN.format(
-                user_and_project=GitHubEnv.github_repository(), sha=pull_request_commit_sha
-            )
-        else:
-            main_branch_commit_sha = GitHubEnv.github_sha()
-            pull_request_commit_sha = None
-            commit_url = GitTool.GITHUB_COMMIT_URL_PATTERN.format(
-                user_and_project=GitHubEnv.github_repository(), sha=main_branch_commit_sha
-            )
-        logger.info(
-            "GitHub version info. Ref name: %s, commit URL: %s, main branch commit sha: %s, "
-            "pull request commit sha: %s",
-            GitHubEnv.ref_name(),
-            commit_url,
-            main_branch_commit_sha,
-            pull_request_commit_sha,
-        )
-
         custom_model_version = self._dr_client.create_custom_model_version(
             custom_model_id,
+            is_major_update,
             model_info,
-            GitHubEnv.ref_name(),
-            commit_url,
-            main_branch_commit_sha,
-            pull_request_commit_sha,
+            self._git_model_version,
             changed_file_paths,
             model_info.file_changes.deleted_file_ids,
             from_latest=model_info.flags.should_create_version_from_latest,
         )
         return custom_model_version
+
+    def _update_git_model_version_following_merging(self, model_info, custom_model, latest_version):
+        """
+        Upon merging to the main branch, if a version was created during the pull request
+        (.e.g 'pullRequestCommitSha' is not None), make sure to update the main branch commit SHA
+        of the latest version. It is guaranteed that the merged commit reflects the latest version
+        because otherwise a new version would be created during the push event of the merging
+        process. It is important to update the git info because the pull request branch may be
+        deleted at dome point and the commit page will be lost.
+        """
+
+        if not GitHubEnv.is_push():
+            return custom_model, latest_version
+
+        user_provided_id = custom_model["userProvidedId"]
+        if custom_model["gitModelVersion"]["pullRequestCommitSha"]:
+            # The settings of the given custom model were updated within a pull request.
+            custom_model = self._dr_client.update_model_settings(
+                custom_model,
+                model_info,
+                self._git_model_version,
+                force_git_model_version_update=True,
+            )
+        if latest_version["gitModelVersion"]["pullRequestCommitSha"]:
+            # A custom model version was created within the pull request.
+            latest_version = self._update_custom_model_version_git_attributes(
+                model_info, latest_version
+            )
+            self.datarobot_models[user_provided_id].latest_version = latest_version
+
+        return custom_model, latest_version
 
     def _test_custom_model_version(self, model_id, model_version_id, model_info):
         logger.info(
@@ -647,10 +777,31 @@ class ModelController(ControllerBase):
         self._dr_client.run_custom_model_version_testing(model_id, model_version_id, model_info)
 
     def _update_settings(self, datarobot_custom_model, model_info):
-        self._update_model_settings(datarobot_custom_model, model_info)
-        # NOTE: training/holdout datasets update should always come after model's setting update
-        self._update_training_and_holdout_datasets(datarobot_custom_model, model_info)
-        self.metrics.total_updated_settings.value += 1
+        settings_updated = (
+            self._dr_client.update_model_settings(
+                datarobot_custom_model, model_info, self._git_model_version
+            )
+            is not None
+        )
+        training_holdout_updated = False
+        if not datarobot_custom_model.get("isTrainingDataForVersionsPermanentlyEnabled", False):
+            # NOTE: training/holdout datasets update should always come after model's setting update
+            training_holdout_updated = (
+                self._update_training_and_holdout_datasets(datarobot_custom_model, model_info)
+                is not None
+            )
+            if training_holdout_updated and not settings_updated:
+                self._dr_client.update_model_settings(
+                    datarobot_custom_model,
+                    model_info,
+                    self._git_model_version,
+                    force_git_model_version_update=True,
+                )
+        if settings_updated or training_holdout_updated:
+            logger.info(
+                "Model settings were updated. User provided ID: %s.", model_info.user_provided_id
+            )
+            self.metrics.total_updated_settings.value += 1
 
     def _update_training_and_holdout_datasets(self, datarobot_custom_model, model_info):
         if model_info.is_unstructured:
@@ -665,10 +816,10 @@ class ModelController(ControllerBase):
                     "User provided ID: %s. Training dataset name: %s. Training dataset ID: %s. "
                     "Holdout dataset name: %s. Holdout dataset ID: %s",
                     model_info.user_provided_id,
-                    custom_model["externalMlopsStatsConfig"]["trainingDatasetName"],
-                    custom_model["externalMlopsStatsConfig"]["trainingDatasetId"],
-                    custom_model["externalMlopsStatsConfig"]["holdoutDatasetName"],
-                    custom_model["externalMlopsStatsConfig"]["holdoutDatasetId"],
+                    custom_model["externalMlopsStatsConfig"].get("trainingDatasetName"),
+                    custom_model["externalMlopsStatsConfig"].get("trainingDatasetId"),
+                    custom_model["externalMlopsStatsConfig"].get("holdoutDatasetName"),
+                    custom_model["externalMlopsStatsConfig"].get("holdoutDatasetId"),
                 )
         else:
             custom_model = self._dr_client.update_training_dataset_for_structured_models(
@@ -683,13 +834,7 @@ class ModelController(ControllerBase):
                     custom_model["trainingDatasetId"],
                     custom_model["trainingDatasetVersionId"],
                 )
-
-    def _update_model_settings(self, datarobot_custom_model, model_info):
-        custom_model = self._dr_client.update_model_settings(datarobot_custom_model, model_info)
-        if custom_model:
-            logger.info(
-                "Model settings were updated. User provided ID: %s.", model_info.user_provided_id
-            )
+        return custom_model
 
     def handle_deleted_models(self):
         """
